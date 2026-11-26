@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use jni::{
     objects::{GlobalRef, JClass, JObject, JString, JValue},
-    sys::{jboolean, jint},
+    sys::{jboolean, jint, jlong},
     JNIEnv, JavaVM,
 };
 use std::path::PathBuf;
@@ -239,6 +239,7 @@ pub extern "system" fn Java_dev_rstream_app_RStreamVpn_nativeVpnChanged(
     _class: JClass,
     active: jboolean,
     iface: JString,
+    net_handle: jlong,
 ) {
     let is_active = active != 0;
     let iface_name = if iface.is_null() {
@@ -249,8 +250,8 @@ pub extern "system" fn Java_dev_rstream_app_RStreamVpn_nativeVpnChanged(
     if let Ok(mut slot) = VPN_STATE.lock() {
         *slot = (is_active, iface_name.clone());
     }
-    stremio_torrent::set_android_vpn_state(is_active, iface_name.clone());
-    log(&format!("vpn state: active={is_active} iface={iface_name:?}"));
+    stremio_torrent::set_android_vpn_state_with_handle(is_active, iface_name.clone(), net_handle as u64);
+    log(&format!("vpn state: active={is_active} iface={iface_name:?} handle={net_handle}"));
 }
 
 // ---------------------------------------------------------------- Rust player surface (RStreamVideo.kt)

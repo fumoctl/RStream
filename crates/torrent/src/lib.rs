@@ -14,6 +14,7 @@ use std::{
     fs::{File, OpenOptions},
     future::Future,
     io::SeekFrom,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -35,7 +36,7 @@ const MAX_PIECE: u64 = 128 * 1024 * 1024;
 const MAX_HTTP_CLIENTS: usize = 4;
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
-const VPN_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+const VPN_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const LEAK_PROBE_DURATION: Duration = Duration::from_secs(60);
 const LEAK_PROBE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -84,35 +85,83 @@ pub struct VpnPolicy {
     pub bind_interface: Option<String>,
 }
 
-static ANDROID_VPN_STATE: StdMutex<(bool, Option<String>)> = StdMutex::new((false, None));
+static ANDROID_VPN_STATE: StdMutex<(bool, Option<String>, u64)> = StdMutex::new((false, None, 0));
+static ANDROID_VPN_WATCHERS: StdMutex<Vec<(VpnPolicy, u64, CancellationToken)>> =
+    StdMutex::new(Vec::new());
 
 #[cfg(test)]
 static TEST_INTERFACES_OVERRIDE: StdMutex<Option<Vec<NetworkInterface>>> = StdMutex::new(None);
 
 pub fn set_android_vpn_state(active: bool, iface_name: Option<String>) {
+    set_android_vpn_state_with_handle(active, iface_name, 0);
+}
+
+pub fn set_android_vpn_state_with_handle(
+    active: bool,
+    iface_name: Option<String>,
+    net_handle: u64,
+) {
     let iface = iface_name.and_then(|s| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_owned())
     });
+    let effective_handle = if active { net_handle } else { 0 };
     if let Ok(mut guard) = ANDROID_VPN_STATE.lock() {
-        *guard = (active, iface);
+        *guard = (active, iface.clone(), effective_handle);
+    }
+    if let Ok(mut watchers) = ANDROID_VPN_WATCHERS.lock() {
+        watchers.retain(|(policy, expected_handle, token)| {
+            if token.is_cancelled() {
+                return false;
+            }
+            if !active
+                || (*expected_handle != 0 && effective_handle != *expected_handle)
+                || policy
+                    .bind_interface
+                    .as_deref()
+                    .is_some_and(|exp| iface.as_deref() != Some(exp))
+            {
+                token.cancel();
+                return false;
+            }
+            true
+        });
     }
 }
 
 pub fn android_vpn_state() -> (bool, Option<String>) {
     ANDROID_VPN_STATE
         .lock()
-        .map(|g| g.clone())
+        .map(|g| (g.0, g.1.clone()))
         .unwrap_or((false, None))
+}
+
+pub fn android_vpn_network_handle() -> u64 {
+    ANDROID_VPN_STATE.lock().map(|g| g.2).unwrap_or(0)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn register_android_vpn_watcher(policy: &VpnPolicy, net_handle: u64, token: &CancellationToken) {
+    if let Ok(mut watchers) = ANDROID_VPN_WATCHERS.lock() {
+        watchers.retain(|(_, _, t)| !t.is_cancelled());
+        watchers.push((policy.clone(), net_handle, token.clone()));
+    }
+}
+
+/// Strictly matches RFC 4291 global unicast IPv6 (`2000::/3`), rejecting link-local (`fe80::/10`),
+/// ULA sinkholes (`fc00::/7`, e.g. AmneziaVPN `fd58::`), site-local (`fec0::/10`), loopback, and unspecified.
+fn is_global_unicast_v6(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xe000) == 0x2000
 }
 
 fn is_vpn_interface_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ["tun", "tap", "wg", "utun", "ppp"]
+    ["tun", "tap", "wg", "utun", "ppp", "amn", "awg"]
         .iter()
         .any(|prefix| lower.starts_with(prefix))
         || [
             "wireguard",
+            "amnezia",
             "wintun",
             "openvpn",
             "tap-windows",
@@ -183,8 +232,7 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
                         std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in6>())
                     };
                     let v6 = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                    (!v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local())
-                        .then(|| v6.to_string())
+                    is_global_unicast_v6(v6).then(|| v6.to_string())
                 }
                 _ => None,
             };
@@ -219,7 +267,15 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
 }
 
 #[cfg(windows)]
-pub fn list_interfaces() -> Vec<NetworkInterface> {
+#[derive(Clone, Debug)]
+struct WinAdapterDetail {
+    iface: NetworkInterface,
+    if_index: u32,
+    ipv6_if_index: u32,
+}
+
+#[cfg(windows)]
+fn win_list_adapter_details() -> Vec<WinAdapterDetail> {
     use core::ffi::{c_char, c_void};
 
     const AF_UNSPEC: u32 = 0;
@@ -272,10 +328,13 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
         address: WinSocketAddress,
     }
 
-    #[repr(C)]
+    // Matches Win32 `_IP_ADAPTER_ADDRESSES_LH`: IfIndex sits in the top union (after Length),
+    // and Ipv6IfIndex sits immediately after OperStatus.
+    #[repr(C, align(8))]
     #[allow(dead_code)]
     struct WinAdapterAddresses {
-        alignment: u64,
+        length: u32,
+        if_index: u32,
         next: *const Self,
         adapter_name: *const c_char,
         first_unicast_address: *const WinAdapterUnicastAddress,
@@ -291,6 +350,7 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
         mtu: u32,
         if_type: u32,
         oper_status: i32,
+        ipv6_if_index: u32,
     }
 
     #[link(name = "iphlpapi")]
@@ -386,14 +446,13 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
             let ip = if family == AF_INET && sa_len >= std::mem::size_of::<WinSockAddrIn>() {
                 // SAFETY: `sa_len` covers `WinSockAddrIn`.
                 let sin = unsafe { std::ptr::read_unaligned(sa.cast::<WinSockAddrIn>()) };
-                let v4 = std::net::Ipv4Addr::from(sin.sin_addr);
+                let v4 = Ipv4Addr::from(sin.sin_addr);
                 (!v4.is_loopback() && !v4.is_unspecified()).then(|| v4.to_string())
             } else if family == AF_INET6 && sa_len >= std::mem::size_of::<WinSockAddrIn6>() {
                 // SAFETY: `sa_len` covers `WinSockAddrIn6`.
                 let sin6 = unsafe { std::ptr::read_unaligned(sa.cast::<WinSockAddrIn6>()) };
-                let v6 = std::net::Ipv6Addr::from(sin6.sin6_addr);
-                (!v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local())
-                    .then(|| v6.to_string())
+                let v6 = Ipv6Addr::from(sin6.sin6_addr);
+                is_global_unicast_v6(v6).then(|| v6.to_string())
             } else {
                 None
             };
@@ -408,14 +467,26 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
         let is_vpn_like = is_vpn_interface_name(&name)
             || is_vpn_interface_name(&adapter_name)
             || is_vpn_interface_name(&description);
-        out.push(NetworkInterface {
-            name,
-            addrs,
-            is_up,
-            is_vpn_like,
+        out.push(WinAdapterDetail {
+            iface: NetworkInterface {
+                name,
+                addrs,
+                is_up,
+                is_vpn_like,
+            },
+            if_index: adapter.if_index,
+            ipv6_if_index: adapter.ipv6_if_index,
         });
     }
     out
+}
+
+#[cfg(windows)]
+pub fn list_interfaces() -> Vec<NetworkInterface> {
+    win_list_adapter_details()
+        .into_iter()
+        .map(|d| d.iface)
+        .collect()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -426,14 +497,37 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
 #[cfg(not(target_os = "android"))]
 fn has_usable_addr(iface: &NetworkInterface) -> bool {
     iface.addrs.iter().any(|a| {
-        if let Ok(v4) = a.parse::<std::net::Ipv4Addr>() {
+        if let Ok(v4) = a.parse::<Ipv4Addr>() {
             !v4.is_loopback() && !v4.is_unspecified()
-        } else if let Ok(v6) = a.parse::<std::net::Ipv6Addr>() {
-            !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local()
+        } else if let Ok(v6) = a.parse::<Ipv6Addr>() {
+            is_global_unicast_v6(v6)
         } else {
             false
         }
     })
+}
+
+#[cfg(any(windows, target_os = "android"))]
+fn extract_first_v4_and_global_v6(addrs: &[String]) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    let mut first_v4 = None;
+    let mut first_v6 = None;
+    for raw in addrs {
+        if first_v4.is_none() {
+            if let Ok(v4) = raw.parse::<Ipv4Addr>() {
+                if !v4.is_loopback() && !v4.is_unspecified() {
+                    first_v4 = Some(v4);
+                }
+            }
+        }
+        if first_v6.is_none() {
+            if let Ok(v6) = raw.parse::<Ipv6Addr>() {
+                if is_global_unicast_v6(v6) {
+                    first_v6 = Some(v6);
+                }
+            }
+        }
+    }
+    (first_v4, first_v6)
 }
 
 fn current_interfaces() -> Vec<NetworkInterface> {
@@ -446,6 +540,29 @@ fn current_interfaces() -> Vec<NetworkInterface> {
     list_interfaces()
 }
 
+#[cfg(windows)]
+fn current_win_adapter_details() -> Vec<WinAdapterDetail> {
+    #[cfg(test)]
+    if let Ok(guard) = TEST_INTERFACES_OVERRIDE.lock() {
+        if let Some(override_ifaces) = guard.as_ref() {
+            return override_ifaces
+                .iter()
+                .enumerate()
+                .map(|(i, iface)| {
+                    let (v4, v6) = extract_first_v4_and_global_v6(&iface.addrs);
+                    let idx = (i as u32) + 1;
+                    WinAdapterDetail {
+                        iface: iface.clone(),
+                        if_index: if v4.is_some() { idx } else { 0 },
+                        ipv6_if_index: if v6.is_some() { idx } else { 0 },
+                    }
+                })
+                .collect();
+        }
+    }
+    win_list_adapter_details()
+}
+
 fn normalize_policy(mut policy: VpnPolicy) -> VpnPolicy {
     policy.bind_interface = policy.bind_interface.and_then(|s| {
         let t = s.trim();
@@ -454,8 +571,50 @@ fn normalize_policy(mut policy: VpnPolicy) -> VpnPolicy {
     policy
 }
 
-#[cfg(not(target_os = "android"))]
-fn resolve_bind_device(policy: &VpnPolicy) -> Result<Option<String>> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum VpnBinding {
+    Unbound,
+    NativeDevice(String),
+    WindowsAdapter {
+        name: String,
+        if_index: u32,
+        ipv6_if_index: u32,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    },
+    AndroidNetwork {
+        iface: Option<String>,
+        net_handle: u64,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    },
+}
+
+impl VpnBinding {
+    fn iface_name(&self) -> Option<&str> {
+        match self {
+            Self::Unbound => None,
+            Self::NativeDevice(name) => Some(name.as_str()),
+            Self::WindowsAdapter { name, .. } => Some(name.as_str()),
+            Self::AndroidNetwork { iface, .. } => iface.as_deref(),
+        }
+    }
+
+    fn uses_socks_tunnel(&self) -> bool {
+        matches!(self, Self::WindowsAdapter { .. } | Self::AndroidNetwork { .. })
+    }
+
+    fn android_handle(&self) -> u64 {
+        match self {
+            Self::AndroidNetwork { net_handle, .. } => *net_handle,
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
+fn resolve_vpn_binding(policy: &VpnPolicy) -> Result<VpnBinding> {
     let ifaces = current_interfaces();
     if let Some(iface) = policy.bind_interface.as_deref() {
         let found = ifaces
@@ -467,20 +626,52 @@ fn resolve_bind_device(policy: &VpnPolicy) -> Result<Option<String>> {
             }
             bail!("bound network interface '{iface}' is not up or has no addresses");
         }
-        return Ok(Some(iface.to_owned()));
+        return Ok(VpnBinding::NativeDevice(iface.to_owned()));
     }
     if policy.killswitch {
         let vpn = ifaces
             .iter()
             .find(|i| i.is_vpn_like && i.is_up && has_usable_addr(i))
             .context("VPN killswitch blocked torrent: no active VPN tunnel found")?;
-        return Ok(Some(vpn.name.clone()));
+        return Ok(VpnBinding::NativeDevice(vpn.name.clone()));
     }
-    Ok(None)
+    Ok(VpnBinding::Unbound)
+}
+
+#[cfg(windows)]
+fn resolve_vpn_binding(policy: &VpnPolicy) -> Result<VpnBinding> {
+    let adapters = current_win_adapter_details();
+    let detail = if let Some(iface) = policy.bind_interface.as_deref() {
+        let Some(found) = adapters
+            .into_iter()
+            .find(|d| d.iface.name == iface && d.iface.is_up && has_usable_addr(&d.iface))
+        else {
+            if policy.killswitch {
+                bail!("VPN killswitch blocked torrent: bound interface '{iface}' is not active");
+            }
+            bail!("bound network interface '{iface}' is not up or has no addresses");
+        };
+        found
+    } else if policy.killswitch {
+        adapters
+            .into_iter()
+            .find(|d| d.iface.is_vpn_like && d.iface.is_up && has_usable_addr(&d.iface))
+            .context("VPN killswitch blocked torrent: no active VPN tunnel found")?
+    } else {
+        return Ok(VpnBinding::Unbound);
+    };
+    let (ipv4, ipv6) = extract_first_v4_and_global_v6(&detail.iface.addrs);
+    Ok(VpnBinding::WindowsAdapter {
+        name: detail.iface.name,
+        if_index: detail.if_index,
+        ipv6_if_index: detail.ipv6_if_index,
+        ipv4,
+        ipv6,
+    })
 }
 
 #[cfg(target_os = "android")]
-fn resolve_bind_device(policy: &VpnPolicy) -> Result<Option<String>> {
+fn resolve_vpn_binding(policy: &VpnPolicy) -> Result<VpnBinding> {
     if policy.killswitch || policy.bind_interface.is_some() {
         let (active, current_iface) = android_vpn_state();
         ensure!(
@@ -493,11 +684,24 @@ fn resolve_bind_device(policy: &VpnPolicy) -> Result<Option<String>> {
                 "VPN killswitch blocked torrent: active VPN interface does not match '{expected}'"
             );
         }
+        let net_handle = android_vpn_network_handle();
+        let ifaces = current_interfaces();
+        let (ipv4, ipv6) = current_iface
+            .as_deref()
+            .and_then(|name| ifaces.iter().find(|i| i.name == name))
+            .map(|i| extract_first_v4_and_global_v6(&i.addrs))
+            .unwrap_or((None, None));
+        return Ok(VpnBinding::AndroidNetwork {
+            iface: current_iface,
+            net_handle,
+            ipv4,
+            ipv6,
+        });
     }
-    // Unprivileged Android apps cannot use SO_BINDTODEVICE; ConnectivityManager gates tunnel state.
-    Ok(None)
+    Ok(VpnBinding::Unbound)
 }
 
+#[allow(dead_code)]
 fn is_vpn_policy_satisfied(policy: &VpnPolicy, bound_iface: Option<&str>) -> bool {
     #[cfg(not(target_os = "android"))]
     {
@@ -530,9 +734,17 @@ fn is_vpn_policy_satisfied(policy: &VpnPolicy, bound_iface: Option<&str>) -> boo
     }
 }
 
+fn is_vpn_binding_satisfied(policy: &VpnPolicy, binding: &VpnBinding) -> bool {
+    if !is_vpn_policy_satisfied(policy, binding.iface_name()) {
+        return false;
+    }
+    let expected_handle = binding.android_handle();
+    expected_handle == 0 || android_vpn_network_handle() == expected_handle
+}
+
 fn spawn_vpn_watcher(
     policy: VpnPolicy,
-    bound_iface: Option<String>,
+    binding: VpnBinding,
     token: CancellationToken,
     session: Arc<Session>,
 ) -> JoinHandle<()> {
@@ -545,7 +757,7 @@ fn spawn_vpn_watcher(
                 biased;
                 _ = token.cancelled() => break,
                 _ = interval.tick() => {
-                    if !is_vpn_policy_satisfied(&policy, bound_iface.as_deref()) {
+                    if !is_vpn_binding_satisfied(&policy, &binding) {
                         token.cancel();
                         session.stop().await;
                         break;
@@ -554,6 +766,1008 @@ fn spawn_vpn_watcher(
             }
         }
     })
+}
+
+#[cfg(target_os = "android")]
+fn bind_fd_to_android_network(fd: libc::c_int, net_handle: u64) -> Result<()> {
+    #[link(name = "android")]
+    extern "C" {
+        fn android_setsocknetwork(network: u64, fd: libc::c_int) -> libc::c_int;
+    }
+    ensure!(net_handle != 0, "Android VPN network handle is unavailable");
+    // SAFETY: `fd` is an open socket file descriptor owned by the caller and `net_handle`
+    // comes from `android.net.Network.getNetworkHandle()`.
+    let rc = unsafe { android_setsocknetwork(net_handle, fd) };
+    if rc != 0 {
+        let err = std::io::Error::from_raw_os_error(if rc < 0 { -rc } else { rc });
+        return Err(err).context("android_setsocknetwork failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn android_network_has_global_ipv6(net_handle: u64) -> bool {
+    use std::os::fd::AsRawFd;
+    if net_handle == 0 {
+        return false;
+    }
+    let Ok(sock) = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    if bind_fd_to_android_network(sock.as_raw_fd(), net_handle).is_err() {
+        return false;
+    }
+    let target = SocketAddr::V6(std::net::SocketAddrV6::new(
+        Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+        53,
+        0,
+        0,
+    ));
+    if sock.connect(target).is_err() {
+        return false;
+    }
+    matches!(
+        sock.local_addr(),
+        Ok(SocketAddr::V6(sa)) if is_global_unicast_v6(*sa.ip())
+    )
+}
+
+#[cfg(windows)]
+fn bind_windows_unicast_if(raw_socket: usize, if_index: u32, is_ipv6: bool) -> Result<()> {
+    use core::ffi::c_char;
+    const IPPROTO_IP: i32 = 0;
+    const IP_UNICAST_IF: i32 = 31;
+    const IPPROTO_IPV6: i32 = 41;
+    const IPV6_UNICAST_IF: i32 = 31;
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn setsockopt(
+            s: usize,
+            level: i32,
+            optname: i32,
+            optval: *const c_char,
+            optlen: i32,
+        ) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    ensure!(
+        if_index != 0,
+        "Windows VPN adapter has no {} interface index",
+        if is_ipv6 { "IPv6" } else { "IPv4" }
+    );
+    // WinSock expects IP_UNICAST_IF in network byte order and IPV6_UNICAST_IF in host byte order.
+    let raw_idx: u32 = if is_ipv6 { if_index } else { if_index.to_be() };
+    let (level, optname) = if is_ipv6 {
+        (IPPROTO_IPV6, IPV6_UNICAST_IF)
+    } else {
+        (IPPROTO_IP, IP_UNICAST_IF)
+    };
+    // SAFETY: `raw_socket` is a valid WinSock HANDLE and `raw_idx` is a 4-byte `u32`.
+    let rc = unsafe {
+        setsockopt(
+            raw_socket,
+            level,
+            optname,
+            (&raw_idx as *const u32).cast::<c_char>(),
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if rc != 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(std::io::Error::from_raw_os_error(code)).with_context(|| {
+            format!("WinSock unicast interface bind failed for index {if_index}")
+        });
+    }
+    Ok(())
+}
+
+async fn bind_bound_udp(is_ipv6: bool, binding: &VpnBinding) -> Result<tokio::net::UdpSocket> {
+    let unspec = |v6: bool| -> SocketAddr {
+        if v6 {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        }
+    };
+    match binding {
+        VpnBinding::Unbound => Ok(tokio::net::UdpSocket::bind(unspec(is_ipv6)).await?),
+        VpnBinding::NativeDevice(iface) => {
+            let sock = tokio::net::UdpSocket::bind(unspec(is_ipv6)).await?;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            sock.bind_device(Some(iface.as_bytes()))
+                .with_context(|| format!("failed binding UDP socket to interface '{iface}'"))?;
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::fd::AsRawFd;
+                let c_iface = std::ffi::CString::new(iface.as_str())
+                    .with_context(|| format!("invalid interface name '{iface}'"))?;
+                // SAFETY: `c_iface` is a valid NUL-terminated string.
+                let idx = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
+                ensure!(idx != 0, "unknown network interface '{iface}'");
+                let (level, optname) = if is_ipv6 {
+                    (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+                } else {
+                    (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+                };
+                // SAFETY: `sock` is a valid UDP socket fd and `idx` is a `c_uint` interface index.
+                let rc = unsafe {
+                    libc::setsockopt(
+                        sock.as_raw_fd(),
+                        level,
+                        optname,
+                        (&idx as *const libc::c_uint).cast(),
+                        std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                    )
+                };
+                ensure!(
+                    rc == 0,
+                    "failed binding UDP socket to interface '{iface}': {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+            let _ = iface;
+            Ok(sock)
+        }
+        VpnBinding::WindowsAdapter {
+            name,
+            if_index,
+            ipv6_if_index,
+            ipv4,
+            ipv6,
+        } => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawSocket;
+                let (idx, local_ip) = if is_ipv6 {
+                    (
+                        *ipv6_if_index,
+                        std::net::IpAddr::V6(ipv6.with_context(|| {
+                            format!("Windows VPN adapter '{name}' has no global IPv6 address")
+                        })?),
+                    )
+                } else {
+                    (
+                        *if_index,
+                        std::net::IpAddr::V4(ipv4.with_context(|| {
+                            format!("Windows VPN adapter '{name}' has no IPv4 address")
+                        })?),
+                    )
+                };
+                let sock = tokio::net::UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?;
+                bind_windows_unicast_if(sock.as_raw_socket() as usize, idx, is_ipv6)?;
+                Ok(sock)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (name, if_index, ipv6_if_index, ipv4, ipv6);
+                bail!("Windows adapter UDP binding unavailable on this platform");
+            }
+        }
+        VpnBinding::AndroidNetwork {
+            iface,
+            net_handle,
+            ipv4,
+            ipv6,
+        } => {
+            #[cfg(target_os = "android")]
+            {
+                use std::os::fd::AsRawFd;
+                let bind_addr = match (is_ipv6, ipv6, ipv4) {
+                    (true, Some(v6), _) => SocketAddr::new(std::net::IpAddr::V6(*v6), 0),
+                    (false, _, Some(v4)) => SocketAddr::new(std::net::IpAddr::V4(*v4), 0),
+                    _ => unspec(is_ipv6),
+                };
+                let sock = tokio::net::UdpSocket::bind(bind_addr).await?;
+                if *net_handle != 0 {
+                    bind_fd_to_android_network(sock.as_raw_fd(), *net_handle)?;
+                } else if let Some(dev) = iface {
+                    sock.bind_device(Some(dev.as_bytes()))
+                        .with_context(|| format!("failed binding UDP socket to '{dev}'"))?;
+                } else {
+                    bail!("Android VPN UDP socket binding unavailable");
+                }
+                Ok(sock)
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let _ = (iface, net_handle, ipv4, ipv6);
+                if cfg!(test) {
+                    Ok(tokio::net::UdpSocket::bind(unspec(is_ipv6)).await?)
+                } else {
+                    bail!("Android network UDP binding unavailable on this platform");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+async fn connect_bound_tcp(target: SocketAddr, binding: &VpnBinding) -> Result<TcpStream> {
+    let sock = if target.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    match binding {
+        VpnBinding::Unbound => {}
+        VpnBinding::NativeDevice(iface) => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            sock.bind_device(Some(iface.as_bytes()))
+                .with_context(|| format!("failed binding TCP socket to '{iface}'"))?;
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::fd::AsRawFd;
+                let c_iface = std::ffi::CString::new(iface.as_str())
+                    .with_context(|| format!("invalid interface name '{iface}'"))?;
+                let idx = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
+                ensure!(idx != 0, "unknown network interface '{iface}'");
+                let (level, optname) = if target.is_ipv6() {
+                    (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+                } else {
+                    (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+                };
+                let rc = unsafe {
+                    libc::setsockopt(
+                        sock.as_raw_fd(),
+                        level,
+                        optname,
+                        (&idx as *const libc::c_uint).cast(),
+                        std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                    )
+                };
+                ensure!(rc == 0, "IP_BOUND_IF failed: {}", std::io::Error::last_os_error());
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+            let _ = iface;
+        }
+        VpnBinding::WindowsAdapter {
+            name,
+            if_index,
+            ipv6_if_index,
+            ipv4,
+            ipv6,
+        } => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawSocket;
+                let (idx, local_ip) = if target.is_ipv6() {
+                    (
+                        *ipv6_if_index,
+                        std::net::IpAddr::V6(ipv6.with_context(|| {
+                            format!("Windows VPN adapter '{name}' has no global IPv6 address")
+                        })?),
+                    )
+                } else {
+                    (
+                        *if_index,
+                        std::net::IpAddr::V4(ipv4.with_context(|| {
+                            format!("Windows VPN adapter '{name}' has no IPv4 address")
+                        })?),
+                    )
+                };
+                bind_windows_unicast_if(sock.as_raw_socket() as usize, idx, target.is_ipv6())?;
+                sock.bind(SocketAddr::new(local_ip, 0))?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (name, if_index, ipv6_if_index, ipv4, ipv6);
+                bail!("Windows adapter TCP binding unavailable on this platform");
+            }
+        }
+        VpnBinding::AndroidNetwork {
+            iface,
+            net_handle,
+            ipv4,
+            ipv6,
+        } => {
+            #[cfg(target_os = "android")]
+            {
+                use std::os::fd::AsRawFd;
+                if *net_handle != 0 {
+                    bind_fd_to_android_network(sock.as_raw_fd(), *net_handle)?;
+                } else if let Some(dev) = iface {
+                    sock.bind_device(Some(dev.as_bytes()))
+                        .with_context(|| format!("failed binding TCP socket to '{dev}'"))?;
+                } else {
+                    bail!("Android VPN TCP socket binding unavailable");
+                }
+                match (target.is_ipv6(), ipv6, ipv4) {
+                    (true, Some(v6), _) => {
+                        sock.bind(SocketAddr::new(std::net::IpAddr::V6(*v6), 0))?
+                    }
+                    (false, _, Some(v4)) => {
+                        sock.bind(SocketAddr::new(std::net::IpAddr::V4(*v4), 0))?
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let _ = (iface, net_handle, ipv4, ipv6);
+                ensure!(cfg!(test), "Android network TCP binding unavailable on this platform");
+            }
+        }
+    }
+    let stream = tokio::time::timeout(Duration::from_secs(8), sock.connect(target))
+        .await
+        .context("bound TCP connect timeout")??;
+    Ok(stream)
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn is_allowed_socks_target(ip: std::net::IpAddr, ipv4_only: bool, allow_loopback: bool) -> bool {
+    if ipv4_only && ip.is_ipv6() {
+        return false;
+    }
+    if allow_loopback {
+        return !ip.is_unspecified();
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => is_global_unicast_v6(v6),
+    }
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+async fn send_socks5_reply(client: &mut TcpStream, rep: u8, bound: Option<SocketAddr>) {
+    let mut pkt = [0u8; 22];
+    let len = match bound {
+        Some(SocketAddr::V6(v6)) => {
+            pkt[0] = 0x05;
+            pkt[1] = rep;
+            pkt[2] = 0x00;
+            pkt[3] = 0x04;
+            pkt[4..20].copy_from_slice(&v6.ip().octets());
+            pkt[20..22].copy_from_slice(&v6.port().to_be_bytes());
+            22
+        }
+        Some(SocketAddr::V4(v4)) => {
+            pkt[0] = 0x05;
+            pkt[1] = rep;
+            pkt[2] = 0x00;
+            pkt[3] = 0x01;
+            pkt[4..8].copy_from_slice(&v4.ip().octets());
+            pkt[8..10].copy_from_slice(&v4.port().to_be_bytes());
+            10
+        }
+        None => {
+            pkt[0] = 0x05;
+            pkt[1] = rep;
+            pkt[2] = 0x00;
+            pkt[3] = 0x01;
+            10
+        }
+    };
+    let _ = client.write_all(&pkt[..len]).await;
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn ct_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let max = a.len().max(b.len());
+    for i in 0..max {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+async fn handle_socks5_client(
+    mut client: TcpStream,
+    binding: VpnBinding,
+    policy: VpnPolicy,
+    ipv4_only: bool,
+    allow_loopback: bool,
+    expected_secret: Arc<String>,
+    cancel: CancellationToken,
+) {
+    let handshake = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut ver_nmethods = [0u8; 2];
+        client.read_exact(&mut ver_nmethods).await?;
+        ensure!(ver_nmethods[0] == 0x05, "unsupported SOCKS version");
+        let mut methods = vec![0u8; ver_nmethods[1] as usize];
+        client.read_exact(&mut methods).await?;
+        if !methods.contains(&0x02) {
+            let _ = client.write_all(&[0x05, 0xff]).await;
+            bail!("SOCKS5 client did not offer username/password auth");
+        }
+        client.write_all(&[0x05, 0x02]).await?;
+
+        // RFC 1929 username/password subnegotiation (mandatory on loopback).
+        let mut auth_hdr = [0u8; 2];
+        client.read_exact(&mut auth_hdr).await?;
+        if auth_hdr[0] != 0x01 {
+            let _ = client.write_all(&[0x01, 0x01]).await;
+            bail!("unsupported RFC 1929 auth version {}", auth_hdr[0]);
+        }
+        let mut uname = vec![0u8; auth_hdr[1] as usize];
+        client.read_exact(&mut uname).await?;
+        let mut plen = [0u8; 1];
+        client.read_exact(&mut plen).await?;
+        let mut passwd = vec![0u8; plen[0] as usize];
+        client.read_exact(&mut passwd).await?;
+        if !ct_bytes_eq(&uname, b"rstream") || !ct_bytes_eq(&passwd, expected_secret.as_bytes()) {
+            let _ = client.write_all(&[0x01, 0x01]).await;
+            bail!("SOCKS5 auth rejected");
+        }
+        client.write_all(&[0x01, 0x00]).await?;
+
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await?;
+        ensure!(hdr[0] == 0x05, "invalid SOCKS5 request version");
+        if hdr[1] != 0x01 {
+            send_socks5_reply(&mut client, 0x07, None).await;
+            bail!("unsupported SOCKS5 command {}", hdr[1]);
+        }
+        let targets: Vec<SocketAddr> = match hdr[3] {
+            0x01 => {
+                let mut ip = [0u8; 4];
+                client.read_exact(&mut ip).await?;
+                let mut port = [0u8; 2];
+                client.read_exact(&mut port).await?;
+                vec![SocketAddr::from((Ipv4Addr::from(ip), u16::from_be_bytes(port)))]
+            }
+            0x04 => {
+                let mut ip = [0u8; 16];
+                client.read_exact(&mut ip).await?;
+                let mut port = [0u8; 2];
+                client.read_exact(&mut port).await?;
+                if ipv4_only {
+                    send_socks5_reply(&mut client, 0x08, None).await;
+                    bail!("IPv6 disabled by VPN IPv4-only policy");
+                }
+                vec![SocketAddr::from((Ipv6Addr::from(ip), u16::from_be_bytes(port)))]
+            }
+            0x03 => {
+                let mut dlen = [0u8; 1];
+                client.read_exact(&mut dlen).await?;
+                let mut host_bytes = vec![0u8; dlen[0] as usize];
+                client.read_exact(&mut host_bytes).await?;
+                let mut port = [0u8; 2];
+                client.read_exact(&mut port).await?;
+                let host = String::from_utf8(host_bytes).context("invalid SOCKS5 hostname")?;
+                let port = u16::from_be_bytes(port);
+                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+                    .await?
+                    .collect();
+                addrs
+            }
+            other => {
+                send_socks5_reply(&mut client, 0x08, None).await;
+                bail!("unsupported SOCKS5 ATYP {other}");
+            }
+        };
+        Ok::<_, anyhow::Error>(targets)
+    })
+    .await;
+
+    let targets = match handshake {
+        Ok(Ok(t)) => t,
+        _ => return,
+    };
+
+    if (policy.killswitch || policy.bind_interface.is_some())
+        && !is_vpn_binding_satisfied(&policy, &binding)
+    {
+        cancel.cancel();
+        send_socks5_reply(&mut client, 0x03, None).await;
+        return;
+    }
+
+    let filtered: Vec<SocketAddr> = targets
+        .into_iter()
+        .filter(|addr| is_allowed_socks_target(addr.ip(), ipv4_only, allow_loopback))
+        .collect();
+    if filtered.is_empty() {
+        send_socks5_reply(&mut client, 0x02, None).await;
+        return;
+    }
+
+    let mut upstream = None;
+    for target in filtered {
+        if cancel.is_cancelled() {
+            return;
+        }
+        if let Ok(stream) = connect_bound_tcp(target, &binding).await {
+            upstream = Some(stream);
+            break;
+        }
+    }
+    let mut remote = match upstream {
+        Some(s) => s,
+        None => {
+            send_socks5_reply(&mut client, 0x04, None).await;
+            return;
+        }
+    };
+    send_socks5_reply(&mut client, 0x00, remote.local_addr().ok()).await;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {}
+        _ = tokio::io::copy_bidirectional(&mut client, &mut remote) => {}
+    }
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+async fn spawn_bound_socks5_proxy(
+    binding: VpnBinding,
+    policy: VpnPolicy,
+    ipv4_only: bool,
+    allow_loopback: bool,
+    cancel: CancellationToken,
+) -> Result<(String, JoinHandle<()>)> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    let secret = Arc::new(random_token());
+    let url = format!("socks5h://rstream:{secret}@127.0.0.1:{port}");
+    let sem = Arc::new(tokio::sync::Semaphore::new(128));
+    let handle = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+                accepted = listener.accept() => {
+                    let (socket, peer) = match accepted {
+                        Ok(a) => a,
+                        Err(_) => {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(ACCEPT_BACKOFF) => continue,
+                            }
+                        }
+                    };
+                    if !peer.ip().is_loopback() {
+                        continue;
+                    }
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let b = binding.clone();
+                    let p = policy.clone();
+                    let s = secret.clone();
+                    let c = cancel.clone();
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        handle_socks5_client(socket, b, p, ipv4_only, allow_loopback, s, c).await;
+                    });
+                }
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    });
+    Ok((url, handle))
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn is_usable_peer_addr(ip: std::net::IpAddr, ipv4_only: bool, allow_loopback: bool) -> bool {
+    if ipv4_only && ip.is_ipv6() {
+        return false;
+    }
+    if allow_loopback {
+        return !ip.is_unspecified();
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_multicast(),
+        std::net::IpAddr::V6(v6) => is_global_unicast_v6(v6),
+    }
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn parse_compact_v4_peers(bytes: &[u8], allow_loopback: bool) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(bytes.len() / 6);
+    for chunk in bytes.as_chunks::<6>().0 {
+        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+        if port != 0 && is_usable_peer_addr(std::net::IpAddr::V4(ip), false, allow_loopback) {
+            out.push(SocketAddr::from((ip, port)));
+        }
+    }
+    out
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn parse_compact_v6_peers(bytes: &[u8], allow_loopback: bool) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(bytes.len() / 18);
+    for chunk in bytes.as_chunks::<18>().0 {
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(&chunk[..16]);
+        let ip = Ipv6Addr::from(raw);
+        let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+        if port != 0 && is_usable_peer_addr(std::net::IpAddr::V6(ip), false, allow_loopback) {
+            out.push(SocketAddr::from((ip, port)));
+        }
+    }
+    out
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn parse_bencode_int(input: &[u8]) -> Option<(i64, &[u8])> {
+    let rest = input.strip_prefix(b"i")?;
+    let end = rest.iter().position(|&b| b == b'e')?;
+    let num = std::str::from_utf8(&rest[..end]).ok()?.parse::<i64>().ok()?;
+    Some((num, &rest[end + 1..]))
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn parse_bencode_bytes(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = input.iter().position(|&b| b == b':')?;
+    let len = std::str::from_utf8(&input[..colon])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let after = &input[colon + 1..];
+    if after.len() < len {
+        return None;
+    }
+    Some((&after[..len], &after[len..]))
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn skip_bencode_value(input: &[u8], depth: u8) -> Option<&[u8]> {
+    if depth > 32 {
+        return None;
+    }
+    match *input.first()? {
+        b'i' => Some(parse_bencode_int(input)?.1),
+        b'0'..=b'9' => Some(parse_bencode_bytes(input)?.1),
+        b'l' => {
+            let mut cur = &input[1..];
+            while !cur.starts_with(b"e") {
+                cur = skip_bencode_value(cur, depth + 1)?;
+            }
+            Some(&cur[1..])
+        }
+        b'd' => {
+            let mut cur = &input[1..];
+            while !cur.starts_with(b"e") {
+                cur = parse_bencode_bytes(cur)?.1;
+                cur = skip_bencode_value(cur, depth + 1)?;
+            }
+            Some(&cur[1..])
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn parse_non_compact_peer_dict(
+    input: &[u8],
+    ipv4_only: bool,
+    allow_loopback: bool,
+) -> Option<(Option<SocketAddr>, &[u8])> {
+    let mut cur = input.strip_prefix(b"d")?;
+    let mut ip: Option<std::net::IpAddr> = None;
+    let mut port: Option<u16> = None;
+    while !cur.starts_with(b"e") {
+        let (key, after_key) = parse_bencode_bytes(cur)?;
+        cur = match key {
+            b"ip" => {
+                let (val, rest) = parse_bencode_bytes(after_key)?;
+                if let Ok(s) = std::str::from_utf8(val) {
+                    ip = s.parse::<std::net::IpAddr>().ok();
+                }
+                rest
+            }
+            b"port" => {
+                let (val, rest) = parse_bencode_int(after_key)?;
+                port = u16::try_from(val).ok().filter(|&p| p != 0);
+                rest
+            }
+            _ => skip_bencode_value(after_key, 2)?,
+        };
+    }
+    let addr = ip
+        .zip(port)
+        .filter(|(a, _)| is_usable_peer_addr(*a, ipv4_only, allow_loopback))
+        .map(|(a, p)| SocketAddr::new(a, p));
+    Some((addr, &cur[1..]))
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+fn extract_bencode_tracker_peers(
+    body: &[u8],
+    ipv4_only: bool,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>> {
+    let mut cur = body.strip_prefix(b"d").context("tracker body not a dict")?;
+    let mut peers = Vec::new();
+    while !cur.starts_with(b"e") {
+        let (key, val_rest) =
+            parse_bencode_bytes(cur).context("invalid bencode dict key in tracker response")?;
+        cur = match key {
+            b"failure reason" => {
+                let (msg, _) = parse_bencode_bytes(val_rest).context("invalid failure reason")?;
+                bail!("HTTP tracker failure: {}", String::from_utf8_lossy(msg));
+            }
+            b"peers" => {
+                if val_rest.first().is_some_and(u8::is_ascii_digit) {
+                    let (compact, rest) =
+                        parse_bencode_bytes(val_rest).context("invalid compact peers")?;
+                    peers.extend(parse_compact_v4_peers(compact, allow_loopback));
+                    rest
+                } else if let Some(mut list_cur) = val_rest.strip_prefix(b"l") {
+                    while !list_cur.starts_with(b"e") {
+                        let (maybe_addr, next_item) =
+                            parse_non_compact_peer_dict(list_cur, ipv4_only, allow_loopback)
+                                .context("invalid non-compact peer entry")?;
+                        if let Some(addr) = maybe_addr {
+                            peers.push(addr);
+                        }
+                        list_cur = next_item;
+                    }
+                    &list_cur[1..]
+                } else {
+                    skip_bencode_value(val_rest, 1).context("invalid peers value")?
+                }
+            }
+            b"peers6" if !ipv4_only => {
+                if val_rest.first().is_some_and(u8::is_ascii_digit) {
+                    let (compact, rest) =
+                        parse_bencode_bytes(val_rest).context("invalid compact peers6")?;
+                    peers.extend(parse_compact_v6_peers(compact, allow_loopback));
+                    rest
+                } else {
+                    skip_bencode_value(val_rest, 1).context("invalid peers6 value")?
+                }
+            }
+            _ => skip_bencode_value(val_rest, 1).context("invalid bencode value")?,
+        };
+    }
+    Ok(peers)
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+async fn announce_udp_tracker_peers(
+    tracker_url: &url::Url,
+    binding: &VpnBinding,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    key: u32,
+    ipv4_only: bool,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>> {
+    let host = tracker_url.host_str().context("UDP tracker missing host")?;
+    let port = tracker_url.port().context("UDP tracker missing port")?;
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed resolving UDP tracker {host}:{port}"))?
+        .filter(|a| !ipv4_only || a.is_ipv4())
+        .collect();
+    let v4_target = resolved.iter().copied().find(|a| a.is_ipv4());
+    let v6_target = (!ipv4_only)
+        .then(|| resolved.iter().copied().find(|a| a.is_ipv6()))
+        .flatten();
+    let targets: Vec<SocketAddr> = [v4_target, v6_target].into_iter().flatten().collect();
+    ensure!(!targets.is_empty(), "no usable address for UDP tracker");
+
+    let mut peers = Vec::new();
+    let mut last_err = None;
+    for target in targets {
+        let sock = match bind_bound_udp(target.is_ipv6(), binding).await {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let tid_connect = rand::thread_rng().next_u32();
+        let mut connect_req = [0u8; 16];
+        connect_req[0..8].copy_from_slice(&0x41727101980u64.to_be_bytes());
+        connect_req[8..12].copy_from_slice(&0u32.to_be_bytes());
+        connect_req[12..16].copy_from_slice(&tid_connect.to_be_bytes());
+        if let Err(e) = sock.send_to(&connect_req, target).await {
+            last_err = Some(e.into());
+            continue;
+        }
+        let mut recv_buf = [0u8; 4096];
+        let Ok(Ok((n_conn, _))) =
+            tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut recv_buf)).await
+        else {
+            continue;
+        };
+        if n_conn < 16
+            || u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]) != 0
+            || u32::from_be_bytes([recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7]])
+                != tid_connect
+        {
+            continue;
+        }
+        let connection_id = u64::from_be_bytes([
+            recv_buf[8],
+            recv_buf[9],
+            recv_buf[10],
+            recv_buf[11],
+            recv_buf[12],
+            recv_buf[13],
+            recv_buf[14],
+            recv_buf[15],
+        ]);
+        let tid_ann = rand::thread_rng().next_u32();
+        let mut ann_req = [0u8; 98];
+        ann_req[0..8].copy_from_slice(&connection_id.to_be_bytes());
+        ann_req[8..12].copy_from_slice(&1u32.to_be_bytes());
+        ann_req[12..16].copy_from_slice(&tid_ann.to_be_bytes());
+        ann_req[16..36].copy_from_slice(info_hash);
+        ann_req[36..56].copy_from_slice(peer_id);
+        ann_req[64..72].copy_from_slice(&16384u64.to_be_bytes());
+        ann_req[80..84].copy_from_slice(&2u32.to_be_bytes());
+        ann_req[88..92].copy_from_slice(&key.to_be_bytes());
+        ann_req[92..96].copy_from_slice(&200i32.to_be_bytes());
+        ann_req[96..98].copy_from_slice(&6881u16.to_be_bytes());
+        if sock.send_to(&ann_req, target).await.is_err() {
+            continue;
+        }
+        let Ok(Ok((n_ann, _))) =
+            tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut recv_buf)).await
+        else {
+            continue;
+        };
+        if n_ann < 20
+            || u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]) != 1
+            || u32::from_be_bytes([recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7]]) != tid_ann
+        {
+            continue;
+        }
+        if target.is_ipv6() {
+            peers.extend(parse_compact_v6_peers(&recv_buf[20..n_ann], allow_loopback));
+        } else {
+            peers.extend(parse_compact_v4_peers(&recv_buf[20..n_ann], allow_loopback));
+        }
+    }
+    if peers.is_empty() {
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+    }
+    Ok(peers)
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+async fn announce_http_tracker_peers(
+    client: &reqwest::Client,
+    tracker_url: &url::Url,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    ipv4_only: bool,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>> {
+    let mut u = tracker_url.clone();
+    let mut query = format!(
+        "info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left=16384&compact=1&numwant=200&event=started",
+        percent_encode_20(info_hash),
+        percent_encode_20(peer_id),
+    );
+    if let Some(existing) = u.query() {
+        if !existing.is_empty() {
+            query.push('&');
+            query.push_str(existing);
+        }
+    }
+    u.set_query(Some(&query));
+    let resp = client.get(u.as_str()).send().await?;
+    ensure!(
+        resp.status().is_success(),
+        "HTTP tracker status {}",
+        resp.status()
+    );
+    let body = resp.bytes().await?;
+    ensure!(body.len() <= 512 * 1024, "HTTP tracker response too large");
+    extract_bencode_tracker_peers(&body, ipv4_only, allow_loopback)
+}
+
+#[cfg(any(windows, target_os = "android", test))]
+async fn harvest_bound_tracker_peers(
+    hash_hex: &str,
+    trackers: &[String],
+    binding: &VpnBinding,
+    socks_url: &str,
+    ipv4_only: bool,
+    allow_loopback: bool,
+    cancel: &CancellationToken,
+) -> Vec<SocketAddr> {
+    let Ok(info_hash) = decode_btih(hash_hex) else {
+        return Vec::new();
+    };
+    let peer_id = random_peer_id();
+    let key = rand::thread_rng().next_u32();
+    let http_client = reqwest::Proxy::all(socks_url)
+        .ok()
+        .and_then(|proxy| {
+            reqwest::Client::builder()
+                .proxy(proxy)
+                .timeout(Duration::from_millis(3500))
+                .connect_timeout(Duration::from_millis(2500))
+                .redirect(reqwest::redirect::Policy::limited(2))
+                .user_agent("rqbit 9.1.0")
+                .build()
+                .ok()
+        });
+
+    let mut set = JoinSet::new();
+    for raw in trackers.iter().take(16) {
+        let Ok(u) = url::Url::parse(raw) else {
+            continue;
+        };
+        if u.scheme() == "udp" {
+            let b = binding.clone();
+            set.spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(3500),
+                    announce_udp_tracker_peers(
+                        &u,
+                        &b,
+                        &info_hash,
+                        &peer_id,
+                        key,
+                        ipv4_only,
+                        allow_loopback,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("UDP tracker timeout")))
+            });
+        } else if let Some(client) = http_client.clone() {
+            set.spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(3500),
+                    announce_http_tracker_peers(
+                        &client,
+                        &u,
+                        &info_hash,
+                        &peer_id,
+                        ipv4_only,
+                        allow_loopback,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("HTTP tracker timeout")))
+            });
+        }
+    }
+
+    let started = Instant::now();
+    let deadline = tokio::time::sleep(Duration::from_millis(4500));
+    tokio::pin!(deadline);
+    let mut peers = Vec::new();
+    let mut seen = HashSet::new();
+
+    loop {
+        if cancel.is_cancelled() || set.is_empty() {
+            break;
+        }
+        if peers.len() >= 24 && started.elapsed() >= Duration::from_millis(1000) {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = &mut deadline => break,
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok(Ok(batch))) => {
+                        for addr in batch {
+                            if seen.insert(addr) {
+                                peers.push(addr);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+    set.abort_all();
+    peers
 }
 
 #[derive(Clone, Debug)]
@@ -645,6 +1859,7 @@ struct Lease {
     token: CancellationToken,
     session: Option<Arc<Session>>,
     watcher: Option<JoinHandle<()>>,
+    proxy: Option<JoinHandle<()>>,
     runtime: Option<tokio::runtime::Handle>,
     space_reservation: Option<SpaceReservation>,
     cleanup: LeaseCleanup,
@@ -654,6 +1869,9 @@ impl Drop for Lease {
         self.token.cancel();
         if let Some(watcher) = self.watcher.take() {
             watcher.abort();
+        }
+        if let Some(proxy) = self.proxy.take() {
+            proxy.abort();
         }
         let session = self.session.take();
         let lock = self.lock.take();
@@ -826,7 +2044,7 @@ impl TorrentEngine {
         // Register cancellation synchronously, before this future can be queued or delayed.
         let registered = parse_input(&stream).and_then(|input| {
             let policy = self.vpn_policy();
-            resolve_bind_device(&policy)?;
+            resolve_vpn_binding(&policy)?;
             let token = self.register_lease_token()?;
             Ok((input, token))
         });
@@ -842,7 +2060,7 @@ impl TorrentEngine {
             // session/lease (or spend the metadata timeout) after that cancellation.
             ensure!(!token.is_cancelled(), "torrent preparation cancelled");
             let policy = self.vpn_policy();
-            let bound_device = resolve_bind_device(&policy)?;
+            let binding = resolve_vpn_binding(&policy)?;
             // Directory sweeps and the manager flock are blocking; keep them off
             // the bridge's async workers.
             let mut lease = {
@@ -861,7 +2079,7 @@ impl TorrentEngine {
                         &input,
                         &mut lease,
                         &policy,
-                        bound_device,
+                        binding,
                         ep_hint,
                         false,
                     ),
@@ -919,7 +2137,7 @@ impl TorrentEngine {
         ensure!(!job_id.trim().is_empty(), "job_id must not be empty");
         let input = parse_input(&stream)?;
         let policy = self.vpn_policy();
-        let bound_device = resolve_bind_device(&policy)?;
+        let binding = resolve_vpn_binding(&policy)?;
         let token = self.register_lease_token()?;
         if token.is_cancelled() || stop_token.is_cancelled() {
             if stop_token.is_cancelled() && !keep_partial_on_stop.load(Ordering::Relaxed) {
@@ -971,7 +2189,7 @@ impl TorrentEngine {
             _ = lease_token.cancelled() => Err(anyhow!("torrent download cancelled")),
             result = tokio::time::timeout(
                 self.config.metadata_timeout,
-                self.admit_torrent(&input, &mut lease, &policy, bound_device, ep_hint, true),
+                self.admit_torrent(&input, &mut lease, &policy, binding, ep_hint, true),
             ) => {
                 result.context("torrent metadata/initialization timeout")?
             }
@@ -1038,6 +2256,9 @@ impl TorrentEngine {
                 if let Some(watcher) = lease.watcher.take() {
                     watcher.abort();
                 }
+                if let Some(proxy) = lease.proxy.take() {
+                    proxy.abort();
+                }
                 if let Some(session) = lease.session.take() {
                     session.stop().await;
                 }
@@ -1055,6 +2276,9 @@ impl TorrentEngine {
         lease.token.cancel();
         if let Some(watcher) = lease.watcher.take() {
             watcher.abort();
+        }
+        if let Some(proxy) = lease.proxy.take() {
+            proxy.abort();
         }
         if let Some(session) = lease.session.take() {
             session.stop().await;
@@ -1079,14 +2303,27 @@ impl TorrentEngine {
     pub fn start_leak_probe(&self, magnet_uri: &str) -> Result<()> {
         let parsed = parse_leak_probe_magnet(magnet_uri)?;
         let policy = self.vpn_policy();
-        let bound_device = resolve_bind_device(&policy)?;
+        let binding = resolve_vpn_binding(&policy)?;
         #[cfg(target_os = "android")]
-        let display_iface = bound_device.clone().or_else(|| android_vpn_state().1);
+        let display_iface = binding
+            .iface_name()
+            .map(str::to_owned)
+            .or_else(|| android_vpn_state().1);
         #[cfg(not(target_os = "android"))]
-        let display_iface = bound_device.clone();
+        let display_iface = binding.iface_name().map(str::to_owned);
 
-        let http_client = build_leak_probe_http_client(bound_device.as_deref())?;
+        let http_client = if binding.uses_socks_tunnel() {
+            None
+        } else {
+            Some(build_leak_probe_http_client(binding.iface_name())?)
+        };
         let probe_token = self.register_lease_token()?;
+        #[cfg(target_os = "android")]
+        if matches!(binding, VpnBinding::AndroidNetwork { .. })
+            && (policy.killswitch || policy.bind_interface.is_some())
+        {
+            register_android_vpn_watcher(&policy, binding.android_handle(), &probe_token);
+        }
         let expires_at = Instant::now() + LEAK_PROBE_DURATION;
         let trackers_total = parsed.trackers.len();
         let iface_label = display_iface.as_deref().unwrap_or("default route");
@@ -1124,7 +2361,7 @@ impl TorrentEngine {
             run_id,
             parsed,
             policy,
-            bound_device,
+            binding,
             display_iface,
             http_client,
             probe_token,
@@ -1186,64 +2423,121 @@ impl TorrentEngine {
         input: &Input,
         lease: &mut Lease,
         policy: &VpnPolicy,
-        bound_device: Option<String>,
+        binding: VpnBinding,
         episode_hint: Option<&str>,
         resumable: bool,
     ) -> Result<(Arc<ManagedTorrent>, usize, String, PathBuf, u64, u64)> {
-        let ipv4_only = should_use_ipv4_only(bound_device.as_deref());
-        #[cfg(windows)]
-        let listen_addr = bound_interface_ip(bound_device.as_deref(), ipv4_only)
-            .map(|ip| std::net::SocketAddr::new(ip, 0))
-            .unwrap_or_else(|| {
-                if ipv4_only {
-                    std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
-                } else {
-                    std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
-                }
-            });
-        #[cfg(not(windows))]
-        let listen_addr = if ipv4_only {
-            std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
-        };
-        #[cfg(windows)]
-        let session_bind_device = None;
-        #[cfg(not(windows))]
-        let session_bind_device = bound_device.clone();
+        let ipv4_only = should_use_ipv4_only_for_binding(&binding);
+        let uses_socks = binding.uses_socks_tunnel();
 
-        let session = Session::new_with_opts(
-            lease.dir.clone(),
-            SessionOptions {
-                dht: Some(DhtSessionConfig {
-                    persistence: None,
-                    ..Default::default()
-                }),
-                bind_device_name: session_bind_device,
-                listen: Some(ListenerOptions {
-                    mode: ListenerMode::TcpAndUtp,
-                    listen_addr,
-                    enable_upnp_port_forwarding: false,
+        #[cfg(target_os = "android")]
+        if matches!(binding, VpnBinding::AndroidNetwork { .. })
+            && (policy.killswitch || policy.bind_interface.is_some())
+        {
+            register_android_vpn_watcher(policy, binding.android_handle(), &lease.token);
+        }
+
+        let (session_opts, socks_url) = if uses_socks {
+            #[cfg(any(windows, target_os = "android", test))]
+            {
+                let (socks_url, proxy_task) = spawn_bound_socks5_proxy(
+                    binding.clone(),
+                    policy.clone(),
                     ipv4_only,
+                    false,
+                    lease.token.clone(),
+                )
+                .await?;
+                lease.proxy = Some(proxy_task);
+                (
+                    SessionOptions {
+                        dht: None,
+                        bind_device_name: None,
+                        listen: None,
+                        disable_trackers: true,
+                        connect: Some(librqbit::ConnectionOptions {
+                            proxy_url: Some(socks_url.clone()),
+                            enable_tcp: true,
+                            peer_opts: None,
+                        }),
+                        ipv4_only,
+                        disable_local_service_discovery: true,
+                        cancellation_token: Some(lease.token.clone()),
+                        concurrent_init_limit: Some(1),
+                        ..Default::default()
+                    },
+                    Some(socks_url),
+                )
+            }
+            #[cfg(not(any(windows, target_os = "android", test)))]
+            unreachable!("SOCKS tunnel mode only runs on Windows, Android, or tests");
+        } else {
+            let listen_addr = if ipv4_only {
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+            } else {
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+            };
+            let bind_dev = match &binding {
+                VpnBinding::NativeDevice(name) => Some(name.clone()),
+                _ => None,
+            };
+            (
+                SessionOptions {
+                    dht: Some(DhtSessionConfig {
+                        persistence: None,
+                        ..Default::default()
+                    }),
+                    bind_device_name: bind_dev,
+                    listen: Some(ListenerOptions {
+                        mode: ListenerMode::TcpAndUtp,
+                        listen_addr,
+                        enable_upnp_port_forwarding: false,
+                        ipv4_only,
+                        ..Default::default()
+                    }),
+                    ipv4_only,
+                    disable_local_service_discovery: true,
+                    cancellation_token: Some(lease.token.clone()),
+                    concurrent_init_limit: Some(1),
                     ..Default::default()
-                }),
-                ipv4_only,
-                disable_local_service_discovery: true,
-                cancellation_token: Some(lease.token.clone()),
-                concurrent_init_limit: Some(1),
-                ..Default::default()
-            },
-        )
-        .await?;
+                },
+                None::<String>,
+            )
+        };
+
+        let session = Session::new_with_opts(lease.dir.clone(), session_opts).await?;
         lease.session = Some(session.clone());
 
         if policy.killswitch || policy.bind_interface.is_some() {
             lease.watcher = Some(spawn_vpn_watcher(
                 policy.clone(),
-                bound_device,
+                binding.clone(),
                 lease.token.clone(),
                 session.clone(),
             ));
+        }
+
+        #[cfg_attr(
+            not(any(windows, target_os = "android", test)),
+            allow(unused_mut)
+        )]
+        let mut harvested_peers: Vec<SocketAddr> = Vec::new();
+        if let Some(socks_url) = socks_url.as_deref() {
+            #[cfg(any(windows, target_os = "android", test))]
+            {
+                harvested_peers = harvest_bound_tracker_peers(
+                    &input.hash,
+                    &input.trackers,
+                    &binding,
+                    socks_url,
+                    ipv4_only,
+                    false,
+                    &lease.token,
+                )
+                .await;
+            }
+            #[cfg(not(any(windows, target_os = "android", test)))]
+            let _ = socks_url;
         }
 
         let cached_meta_path = lease.dir.join(".rstream.torrent");
@@ -1274,6 +2568,30 @@ impl TorrentEngine {
             None
         };
 
+        if cached_listed.is_none() && uses_socks && harvested_peers.is_empty() {
+            if let Some(socks_url) = socks_url.as_deref() {
+                #[cfg(any(windows, target_os = "android", test))]
+                {
+                    harvested_peers = harvest_bound_tracker_peers(
+                        &input.hash,
+                        &input.trackers,
+                        &binding,
+                        socks_url,
+                        ipv4_only,
+                        false,
+                        &lease.token,
+                    )
+                    .await;
+                }
+                #[cfg(not(any(windows, target_os = "android", test)))]
+                let _ = socks_url;
+            }
+            ensure!(
+                !harvested_peers.is_empty(),
+                "no reachable peers returned by bound HTTP/UDP trackers over VPN"
+            );
+        }
+
         // Resolve metadata without creating/admitting torrent payload files.
         let listed = match cached_listed {
             Some(r) => r,
@@ -1283,6 +2601,9 @@ impl TorrentEngine {
                         AddTorrent::from_url(input.magnet.clone()),
                         Some(AddTorrentOptions {
                             list_only: true,
+                            initial_peers: (!harvested_peers.is_empty())
+                                .then_some(harvested_peers.clone()),
+                            disable_trackers: uses_socks,
                             ..Default::default()
                         }),
                     )
@@ -1356,6 +2677,12 @@ impl TorrentEngine {
             "insufficient free space (reserve protected)"
         );
         lease.space_reservation = Some(reservation);
+        let mut combined_peers = listed.seen_peers;
+        for addr in harvested_peers {
+            if !combined_peers.contains(&addr) {
+                combined_peers.push(addr);
+            }
+        }
         // Reuse verified metadata rather than resolve the magnet twice. Keep original index.
         let added = session
             .add_torrent(
@@ -1364,8 +2691,10 @@ impl TorrentEngine {
                     overwrite: resumable,
                     only_files: Some(vec![idx]),
                     output_folder: Some(lease.dir.to_string_lossy().into_owned()),
-                    initial_peers: (!listed.seen_peers.is_empty()).then_some(listed.seen_peers),
-                    trackers: (!input.trackers.is_empty()).then_some(input.trackers.clone()),
+                    initial_peers: (!combined_peers.is_empty()).then_some(combined_peers),
+                    disable_trackers: uses_socks,
+                    trackers: (!uses_socks && !input.trackers.is_empty())
+                        .then_some(input.trackers.clone()),
                     ..Default::default()
                 }),
             )
@@ -1431,6 +2760,9 @@ async fn shutdown(mut active: Active) -> Result<()> {
     active.lease.token.cancel();
     if let Some(watcher) = active.lease.watcher.take() {
         watcher.abort();
+    }
+    if let Some(proxy) = active.lease.proxy.take() {
+        proxy.abort();
     }
     let _ = active.server.await;
     if let Some(session) = active.lease.session.take() {
@@ -1860,17 +3192,16 @@ fn select_download_file(
 }
 
 fn should_use_ipv4_only(bound_device: Option<&str>) -> bool {
-    if std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).is_err() {
+    if std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).is_err() {
         return true;
     }
     if let Some(dev) = bound_device {
         let ifaces = current_interfaces();
         if let Some(iface) = ifaces.iter().find(|i| i.name == dev) {
-            let has_v6 = iface.addrs.iter().any(|a| {
-                a.parse::<std::net::Ipv6Addr>().is_ok_and(|v6| {
-                    !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local()
-                })
-            });
+            let has_v6 = iface
+                .addrs
+                .iter()
+                .any(|a| a.parse::<Ipv6Addr>().is_ok_and(is_global_unicast_v6));
             if !has_v6 {
                 return true;
             }
@@ -1879,28 +3210,41 @@ fn should_use_ipv4_only(bound_device: Option<&str>) -> bool {
     false
 }
 
-#[cfg(windows)]
-fn bound_interface_ip(bound_device: Option<&str>, ipv4_only: bool) -> Option<std::net::IpAddr> {
-    let dev = bound_device?;
-    let ifaces = current_interfaces();
-    let iface = ifaces.iter().find(|i| i.name == dev)?;
-    for raw in &iface.addrs {
-        if let Ok(v4) = raw.parse::<std::net::Ipv4Addr>() {
-            if !v4.is_loopback() && !v4.is_unspecified() {
-                return Some(std::net::IpAddr::V4(v4));
-            }
-        }
+fn should_use_ipv4_only_for_binding(binding: &VpnBinding) -> bool {
+    if std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).is_err() {
+        return true;
     }
-    if !ipv4_only {
-        for raw in &iface.addrs {
-            if let Ok(v6) = raw.parse::<std::net::Ipv6Addr>() {
-                if !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local() {
-                    return Some(std::net::IpAddr::V6(v6));
+    match binding {
+        VpnBinding::Unbound => false,
+        VpnBinding::NativeDevice(dev) => should_use_ipv4_only(Some(dev.as_str())),
+        VpnBinding::WindowsAdapter {
+            ipv6,
+            ipv6_if_index,
+            ..
+        } => ipv6.is_none() || *ipv6_if_index == 0,
+        VpnBinding::AndroidNetwork {
+            iface,
+            net_handle,
+            ipv6,
+            ..
+        } => {
+            if ipv6.is_some() {
+                return false;
+            }
+            #[cfg(target_os = "android")]
+            if !cfg!(test) && android_network_has_global_ipv6(*net_handle) {
+                return false;
+            }
+            #[cfg(not(target_os = "android"))]
+            let _ = net_handle;
+            if let Some(dev) = iface.as_deref() {
+                if current_interfaces().iter().any(|i| i.name == dev) {
+                    return should_use_ipv4_only(Some(dev));
                 }
             }
+            true
         }
     }
-    None
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -2039,6 +3383,7 @@ fn open_resumable_lease(
         token,
         session: None,
         watcher: None,
+        proxy: None,
         runtime,
         space_reservation: None,
         cleanup: LeaseCleanup::Resumable {
@@ -2115,10 +3460,6 @@ fn build_leak_probe_http_client(bound_device: Option<&str>) -> Result<reqwest::C
     if let Some(iface) = bound_device {
         builder = builder.interface(iface);
     }
-    #[cfg(windows)]
-    if let Some(ip) = bound_interface_ip(bound_device, should_use_ipv4_only(bound_device)) {
-        builder = builder.local_address(ip);
-    }
     #[cfg(not(any(
         target_os = "android",
         target_os = "fuchsia",
@@ -2130,7 +3471,6 @@ fn build_leak_probe_http_client(bound_device: Option<&str>) -> Result<reqwest::C
         target_os = "tvos",
         target_os = "visionos",
         target_os = "watchos",
-        windows,
     )))]
     let _ = bound_device;
     Ok(builder.build()?)
@@ -2200,15 +3540,15 @@ async fn announce_http_leak_tracker(
 
 async fn announce_udp_leak_tracker(
     tracker_url: &url::Url,
-    bound_device: Option<&str>,
+    binding: &VpnBinding,
     info_hash: &[u8; 20],
     peer_id: &[u8; 20],
     key: u32,
 ) -> Result<()> {
     let host = tracker_url.host_str().context("UDP tracker missing host")?;
     let port = tracker_url.port().context("UDP tracker missing port")?;
-    let ipv4_only = should_use_ipv4_only(bound_device);
-    let mut resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+    let ipv4_only = should_use_ipv4_only_for_binding(binding);
+    let mut resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("failed resolving UDP tracker {host}:{port}"))?
         .filter(|a| !ipv4_only || a.is_ipv4())
@@ -2219,60 +3559,7 @@ async fn announce_udp_leak_tracker(
         .first()
         .context("no usable address for UDP tracker")?;
 
-    #[cfg(windows)]
-    let bind_addr: std::net::SocketAddr = bound_interface_ip(bound_device, target.is_ipv4())
-        .filter(|ip| ip.is_ipv6() == target.is_ipv6())
-        .map(|ip| std::net::SocketAddr::new(ip, 0))
-        .unwrap_or_else(|| {
-            if target.is_ipv6() {
-                (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-            } else {
-                (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
-            }
-        });
-    #[cfg(not(windows))]
-    let bind_addr: std::net::SocketAddr = if target.is_ipv6() {
-        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-    } else {
-        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
-    };
-    let sock = tokio::net::UdpSocket::bind(bind_addr).await?;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Some(iface) = bound_device {
-        sock.bind_device(Some(iface.as_bytes()))
-            .with_context(|| format!("failed binding UDP socket to interface '{iface}'"))?;
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(iface) = bound_device {
-        use std::os::fd::AsRawFd;
-        let c_iface = std::ffi::CString::new(iface)
-            .with_context(|| format!("invalid interface name '{iface}'"))?;
-        // SAFETY: `c_iface` is a valid NUL-terminated string.
-        let idx = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
-        ensure!(idx != 0, "unknown network interface '{iface}'");
-        let (level, optname) = if target.is_ipv6() {
-            (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
-        } else {
-            (libc::IPPROTO_IP, libc::IP_BOUND_IF)
-        };
-        // SAFETY: `sock` is a valid UDP socket fd and `idx` is a `c_uint` interface index.
-        let rc = unsafe {
-            libc::setsockopt(
-                sock.as_raw_fd(),
-                level,
-                optname,
-                (&idx as *const libc::c_uint).cast(),
-                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-            )
-        };
-        ensure!(
-            rc == 0,
-            "failed binding UDP socket to interface '{iface}': {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
-    let _ = bound_device;
+    let sock = bind_bound_udp(target.is_ipv6(), binding).await?;
 
     // BEP-15 Step 1: Connect request (16 bytes)
     let tid_connect = rand::thread_rng().next_u32();
@@ -2357,9 +3644,9 @@ async fn run_leak_probe_task(
     run_id: u64,
     parsed: ParsedLeakProbe,
     policy: VpnPolicy,
-    bound_device: Option<String>,
+    binding: VpnBinding,
     display_iface: Option<String>,
-    http_client: reqwest::Client,
+    http_client: Option<reqwest::Client>,
     cancel: CancellationToken,
     expires_at: Instant,
 ) {
@@ -2369,6 +3656,68 @@ async fn run_leak_probe_task(
     let peer_id = random_peer_id();
     let key = rand::thread_rng().next_u32();
     let watch_vpn = policy.killswitch || policy.bind_interface.is_some();
+
+    let (http_client, _socks_task): (reqwest::Client, Option<JoinHandle<()>>) = match http_client {
+        Some(client) => (client, None),
+        None => {
+            #[cfg(any(windows, target_os = "android", test))]
+            {
+                let ipv4_only = should_use_ipv4_only_for_binding(&binding);
+                match spawn_bound_socks5_proxy(
+                    binding.clone(),
+                    policy.clone(),
+                    ipv4_only,
+                    cfg!(test),
+                    cancel.clone(),
+                )
+                .await
+                {
+                    Ok((socks_url, handle)) => match reqwest::Proxy::all(&socks_url).and_then(|p| {
+                        reqwest::Client::builder()
+                            .proxy(p)
+                            .timeout(Duration::from_secs(10))
+                            .connect_timeout(Duration::from_secs(5))
+                            .redirect(reqwest::redirect::Policy::limited(3))
+                            .user_agent("RStream/0.1")
+                            .build()
+                    }) {
+                        Ok(client) => (client, Some(handle)),
+                        Err(e) => {
+                            handle.abort();
+                            if let Ok(mut inner) = shared.lock() {
+                                if inner.run_id == run_id {
+                                    inner.status.active = false;
+                                    inner.status.remaining_secs = 0;
+                                    inner.expires_at = None;
+                                    inner.cancel = None;
+                                    inner.status.error = Some(e.to_string());
+                                    inner.status.summary =
+                                        format!("Leak probe failed to initialize proxy: {e}");
+                                }
+                            }
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        if let Ok(mut inner) = shared.lock() {
+                            if inner.run_id == run_id {
+                                inner.status.active = false;
+                                inner.status.remaining_secs = 0;
+                                inner.expires_at = None;
+                                inner.cancel = None;
+                                inner.status.error = Some(e.to_string());
+                                inner.status.summary =
+                                    format!("Leak probe failed to initialize proxy: {e}");
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(any(windows, target_os = "android", test)))]
+            unreachable!("bound leak probe HTTP client is always built on this platform")
+        }
+    };
 
     let update_counts = |last_err: Option<String>| {
         let c_count = contacted
@@ -2411,11 +3760,11 @@ async fn run_leak_probe_task(
                 c[idx] = true;
             }
             let client = http_client.clone();
-            let bd = bound_device.clone();
+            let b = binding.clone();
             let ih = parsed.info_hash;
             set.spawn(async move {
                 let res = if tr.scheme() == "udp" {
-                    announce_udp_leak_tracker(&tr, bd.as_deref(), &ih, &peer_id, key).await
+                    announce_udp_leak_tracker(&tr, &b, &ih, &peer_id, key).await
                 } else {
                     announce_http_leak_tracker(&client, &tr, &ih, &peer_id).await
                 };
@@ -2454,7 +3803,7 @@ async fn run_leak_probe_task(
     // Run initial announce round concurrently with cancellation, VPN drop check, and deadline.
     let mut need_round = true;
     loop {
-        if watch_vpn && !is_vpn_policy_satisfied(&policy, bound_device.as_deref()) {
+        if watch_vpn && !is_vpn_binding_satisfied(&policy, &binding) {
             cancel.cancel();
             if let Ok(mut inner) = shared.lock() {
                 if inner.run_id == run_id {
@@ -2483,7 +3832,7 @@ async fn run_leak_probe_task(
                     if watch_vpn {
                         loop {
                             vpn_tick.tick().await;
-                            if !is_vpn_policy_satisfied(&policy, bound_device.as_deref()) {
+                            if !is_vpn_binding_satisfied(&policy, &binding) {
                                 break;
                             }
                         }
@@ -2505,7 +3854,7 @@ async fn run_leak_probe_task(
                 return;
             }
             _ = vpn_tick.tick() => {
-                if watch_vpn && !is_vpn_policy_satisfied(&policy, bound_device.as_deref()) {
+                if watch_vpn && !is_vpn_binding_satisfied(&policy, &binding) {
                     continue;
                 }
                 update_counts(None);
@@ -2514,6 +3863,10 @@ async fn run_leak_probe_task(
                 need_round = true;
             }
         }
+    }
+
+    if let Some(handle) = _socks_task {
+        handle.abort();
     }
 
     if let Ok(mut inner) = shared.lock() {
@@ -2605,6 +3958,7 @@ fn create_lease(
         token,
         session: None,
         watcher: None,
+        proxy: None,
         runtime,
         space_reservation: None,
         cleanup: LeaseCleanup::Ephemeral,
@@ -2915,6 +4269,10 @@ mod tests {
             "WireGuard Tunnel",
             "wintun0",
             "OpenVPN TAP-Windows6",
+            "amn0",
+            "awg0",
+            "AmneziaVPN",
+            "AmneziaWG Tunnel",
         ] {
             assert!(is_vpn_interface_name(name), "{name} should be vpn-like");
         }
@@ -2931,11 +4289,24 @@ mod tests {
         }
     }
     #[test]
-    fn android_vpn_state_roundtrip() {
-        set_android_vpn_state(true, Some("tun0".into()));
+    fn android_vpn_state_roundtrip_and_immediate_cancel() {
+        set_android_vpn_state_with_handle(true, Some("tun0".into()), 42);
         assert_eq!(android_vpn_state(), (true, Some("tun0".into())));
-        set_android_vpn_state(false, None);
+        assert_eq!(android_vpn_network_handle(), 42);
+
+        let token = CancellationToken::new();
+        let policy = VpnPolicy {
+            killswitch: true,
+            bind_interface: None,
+        };
+        register_android_vpn_watcher(&policy, 42, &token);
+        assert!(!token.is_cancelled());
+
+        // Switching to a different handle or dropping VPN immediately cancels the token.
+        set_android_vpn_state_with_handle(false, None, 0);
+        assert!(token.is_cancelled());
         assert_eq!(android_vpn_state(), (false, None));
+        assert_eq!(android_vpn_network_handle(), 0);
     }
     #[test]
     fn episode_hint_and_video_selection() {
@@ -3302,7 +4673,7 @@ mod tests {
         lease.session = Some(session.clone());
         lease.watcher = Some(spawn_vpn_watcher(
             policy,
-            Some("wg-test0".into()),
+            VpnBinding::NativeDevice("wg-test0".into()),
             lease_token.clone(),
             session.clone(),
         ));
@@ -4393,6 +5764,173 @@ mod tests {
         tracker_cancel.cancel();
         let _ = udp_tracker_task.await;
         seed_session.stop().await;
+        Ok(())
+    }
+
+    #[test]
+    fn ipv6_ula_and_sitelocal_rejected_while_global_unicast_enabled() {
+        assert!(!is_global_unicast_v6(Ipv6Addr::LOCALHOST));
+        assert!(!is_global_unicast_v6(Ipv6Addr::UNSPECIFIED));
+        assert!(!is_global_unicast_v6("fe80::1".parse().unwrap()));
+        // AmneziaVPN ULA sinkhole (`fc00::/7`) and Android `wlan0` site-local (`fec0::/10`):
+        assert!(!is_global_unicast_v6("fd58:baa6:dead::1".parse().unwrap()));
+        assert!(!is_global_unicast_v6("fec0::1".parse().unwrap()));
+        // Public `2000::/3` global unicast:
+        assert!(is_global_unicast_v6(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _lock = TEST_OVERRIDE_LOCK.lock().await;
+            let guard = InterfaceOverrideGuard::set(vec![NetworkInterface {
+                name: "amn0".into(),
+                addrs: vec!["100.110.1.2".into(), "fd58:baa6:dead::1".into()],
+                is_up: true,
+                is_vpn_like: true,
+            }]);
+            assert!(
+                should_use_ipv4_only(Some("amn0")),
+                "ULA sinkhole fd58:: must force ipv4_only on IPv4-only AmneziaVPN"
+            );
+
+            // If this host supports IPv6 UDP sockets, a 2000::/3 address disables ipv4_only.
+            if std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).is_ok() {
+                guard.update(vec![NetworkInterface {
+                    name: "amn0".into(),
+                    addrs: vec![
+                        "100.110.1.2".into(),
+                        "fd58:baa6:dead::1".into(),
+                        "2606:4700:4700::1111".into(),
+                    ],
+                    is_up: true,
+                    is_vpn_like: true,
+                }]);
+                assert!(
+                    !should_use_ipv4_only(Some("amn0")),
+                    "dual-stack 2000::/3 VPN must allow IPv6 torrenting"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn tracker_bencode_and_compact_peer_extraction() {
+        let mut body = b"d8:intervali60e5:peers12:".to_vec();
+        // Peer 1: 93.184.216.34:6881
+        body.extend_from_slice(&[93, 184, 216, 34]);
+        body.extend_from_slice(&6881u16.to_be_bytes());
+        // Peer 2: 127.0.0.1:6882 (filtered out when allow_loopback=false)
+        body.extend_from_slice(&[127, 0, 0, 1]);
+        body.extend_from_slice(&6882u16.to_be_bytes());
+        // peers6: 2606:4700:4700::1111:51413
+        body.extend_from_slice(b"6:peers618:");
+        let v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        body.extend_from_slice(&v6.octets());
+        body.extend_from_slice(&51413u16.to_be_bytes());
+        body.push(b'e');
+
+        let dual = extract_bencode_tracker_peers(&body, false, false).unwrap();
+        assert_eq!(
+            dual,
+            vec![
+                "93.184.216.34:6881".parse::<SocketAddr>().unwrap(),
+                "[2606:4700:4700::1111]:51413"
+                    .parse::<SocketAddr>()
+                    .unwrap(),
+            ]
+        );
+        let v4_only = extract_bencode_tracker_peers(&body, true, false).unwrap();
+        assert_eq!(
+            v4_only,
+            vec!["93.184.216.34:6881".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socks5_tunnel_proxies_http_and_cancels_on_token() -> Result<()> {
+        // Start a minimal local HTTP server to test `socks5h://` tunneling, RFC 1929 auth, and cancellation.
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let target_addr = listener.local_addr()?;
+        let srv_cancel = CancellationToken::new();
+        let srv_cancel_rx = srv_cancel.clone();
+        let hit_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_count_srv = hit_count.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = srv_cancel_rx.cancelled() => break,
+                    a = listener.accept() => a,
+                };
+                let Ok((mut sock, _)) = accepted else { break };
+                let hits = hit_count_srv.clone();
+                tokio::spawn(async move {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    let mut buf = [0u8; 512];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+
+        let proxy_cancel = CancellationToken::new();
+        let (socks_url, proxy_task) = spawn_bound_socks5_proxy(
+            VpnBinding::Unbound,
+            VpnPolicy::default(),
+            true,
+            true,
+            proxy_cancel.clone(),
+        )
+        .await?;
+
+        let parsed = url::Url::parse(&socks_url)?;
+        let port = parsed.port().context("socks proxy missing port")?;
+
+        // Unauthenticated client (no-auth 0x00) MUST be rejected before touching upstream.
+        let unauth_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        assert!(unauth_client
+            .get(format!("http://{target_addr}/ping"))
+            .send()
+            .await
+            .is_err());
+
+        // Wrong password MUST be rejected before touching upstream.
+        let bad_auth_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!(
+                "socks5h://rstream:wrongpassword@127.0.0.1:{port}"
+            ))?)
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        assert!(bad_auth_client
+            .get(format!("http://{target_addr}/ping"))
+            .send()
+            .await
+            .is_err());
+        assert_eq!(hit_count.load(Ordering::Relaxed), 0);
+
+        // Per-lease CSPRNG credentials MUST succeed cleanly.
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&socks_url)?)
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let resp = client.get(format!("http://{target_addr}/ping")).send().await?;
+        assert_eq!(resp.text().await?, "ok");
+        assert_eq!(hit_count.load(Ordering::Relaxed), 1);
+
+        // Cancelling the lease token must tear down the SOCKS5 listener immediately.
+        proxy_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), proxy_task).await?;
+        srv_cancel.cancel();
+        let _ = srv.await;
         Ok(())
     }
 }

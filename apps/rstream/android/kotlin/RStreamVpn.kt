@@ -17,7 +17,7 @@ object RStreamVpn {
     private val registered = AtomicBoolean(false)
     private val vpnNetworks = LinkedHashSet<Network>()
 
-    @JvmStatic external fun nativeVpnChanged(active: Boolean, iface: String?)
+    @JvmStatic external fun nativeVpnChanged(active: Boolean, iface: String?, netHandle: Long)
 
     @JvmStatic
     fun init(activity: Activity) {
@@ -65,11 +65,11 @@ object RStreamVpn {
     }
 
     private fun publish(cm: ConnectivityManager) {
-        val (active, iface) = synchronized(vpnNetworks) {
+        val (active, iface, handle) = synchronized(vpnNetworks) {
             val net = vpnNetworks.lastOrNull()
             val name = net?.let { runCatching { cm.getLinkProperties(it)?.interfaceName }.getOrNull() }
-            (net != null) to name
+            Triple(net != null, name, net?.networkHandle ?: 0L)
         }
-        runCatching { nativeVpnChanged(active, iface) }
+        runCatching { nativeVpnChanged(active, iface, handle) }
     }
 }
