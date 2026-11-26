@@ -1,0 +1,31 @@
+[package]
+name = "veylo-video-surface"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license.workspace = true
+publish = false
+description = "Puts libmpv's picture under the app's web view on Linux, Windows and macOS"
+
+[dependencies]
+libmpv2 = { version = "7.0.1", default-features = false }
+libmpv2-sys = "4.0.1"
+
+# Linux and macOS look up GL and GDK symbols at run time.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2"
+
+# Linux: a GtkGLArea under the web view.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+# macOS: a Core Animation OpenGL layer under the WKWebView, EDR (HDR) on screens that have it.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.3"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSGeometry"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSScreen", "NSGraphics", "NSApplication", "objc2-core-foundation", "objc2-quartz-core"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAOpenGLLayer", "CATransaction", "objc2-open-gl", "objc2-core-graphics", "objc2-core-video", "objc2-core-foundation"] }
+objc2-open-gl = { version = "0.3.2", default-features = false, features = ["std", "CGLTypes", "CGLCurrent", "CGLRenderers"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor", "CGColorSpace"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }

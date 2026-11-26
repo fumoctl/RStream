@@ -1,0 +1,9 @@
+/target
+/dist
+/vendor
+/.direnv
+**/target
+*.apk
+*.jks
+__pycache__/
+apps/rstream/windows/mpv/

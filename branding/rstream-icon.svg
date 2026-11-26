@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- RStream: architectural R whose upper lobe is a rounded Play wedge and whose leg is smoked glass. -->
+  <defs>
+    <radialGradient id="glow" cx="28%" cy="18%" r="86%">
+      <stop offset="0" stop-color="#292621"/>
+      <stop offset=".55" stop-color="#0d0c0b"/>
+      <stop offset="1" stop-color="#000000"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".14"/>
+      <stop offset=".5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="230" fill="url(#glow)"/>
+  <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="url(#sheen)" stroke-width="6"/>
+  <!-- Smoked-glass R leg tucked cleanly behind the Play wedge, matching the 766px baseline -->
+  <path d="M518 524 L676 720" fill="none" stroke="#f2efea" stroke-opacity=".5" stroke-width="92" stroke-linecap="round"/>
+  <!-- Solid bone vertical stem (cap 258px, baseline 766px) -->
+  <path d="M336 304 L336 720" fill="none" stroke="#f2efea" stroke-width="92" stroke-linecap="round"/>
+  <!-- Rounded Play wedge forming the upper R loop (cap-aligned at 258px) -->
+  <path d="M452 296 C452 266 485 248 510 264 L700 386 C724 401 724 435 700 450 L510 572 C485 588 452 570 452 540 Z" fill="#f2efea"/>
+</svg>

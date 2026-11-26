@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- RStream mark: vertical stem + rounded Play lobe + smoked-glass leg inside the 66dp safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:pathData="M54.63,55.27 L71.30,75.94" android:strokeColor="#F2EFEA" android:strokeAlpha="0.5"
+        android:strokeWidth="9.70" android:strokeLineCap="round" />
+    <path android:pathData="M35.44,32.06 L35.44,75.94" android:strokeColor="#F2EFEA"
+        android:strokeWidth="9.70" android:strokeLineCap="round" />
+    <path android:pathData="M47.67,31.22 C47.67,28.05 51.15,26.16 53.79,27.84 L73.83,40.71 C76.36,42.29 76.36,45.88 73.83,47.46 L53.79,60.33 C51.15,62.02 47.67,60.12 47.67,56.95 Z"
+        android:fillColor="#F2EFEA" />
+</vector>

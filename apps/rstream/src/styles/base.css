@@ -1,0 +1,164 @@
+/* Veylo's styles, in eight files read in this order (main.rs, STYLE): base, screens, sizes, add-ons, player,
+   pages, motion, tv (TV only).
+   base: tokens, glass, type, controls, the top bar and the app's toasts. */
+
+/* Veylo, glass. One material: smoked glass lit by the title in front.
+   The only light in the room is the artwork (the ambient layer); every control
+   is glass over it, tinted a few percent toward that title's --lamp. */
+:root {
+  --screen: #000000;
+  --seat: #141518;
+  --bone: #f2efea;
+  --dust: #a4a4ac;
+  --amber: #e8b23a;
+  --gutter: 48px;
+  --top-inset: 0px;
+  --bottom-inset: 0px;
+  --display: 'Archivo', 'Roboto Condensed', system-ui, sans-serif;
+  --ui: 'Roboto', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --glass: rgba(24, 25, 30, .5);
+  --glass-strong: rgba(18, 19, 23, .8);
+  --edge: rgba(255, 255, 255, .13);
+  --sheen: rgba(255, 255, 255, .22);
+  --blur: blur(18px) saturate(160%);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--screen); color: var(--bone); overflow: hidden; }
+body { font: 500 15px/1.4 var(--ui); -webkit-font-smoothing: antialiased; }
+button, input { font: inherit; color: inherit; }
+button { background: none; border: 0; padding: 0; cursor: pointer; }
+/* No system tap box: presses answer with the control itself (below). */
+* { -webkit-tap-highlight-color: transparent; }
+button { touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+button:disabled { cursor: default; }
+img { display: block; }
+.icon { flex: none; }
+
+/* ---------------------------------------------------------------- material */
+.glass {
+  --glass-tint: color-mix(in srgb, var(--lamp) 8%, var(--glass));
+  background: var(--glass);
+  background: var(--glass-tint);
+  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1px var(--edge), 0 12px 32px rgba(0, 0, 0, .28);
+}
+/* WebKitGTK 2.54 drops composited layers that combine backdrop-filter with overflow/isolation, and evicts static DMA-BUF tiles ~2s after animations end when the HTML root is opaque; keep html/body transparent over GTK's opaque #000000 vbox (and GtkGLArea while playing) and keep an unoccluded <1/255 alpha keepalive active in both browsing and playback. */
+html:has(.app.linux), body:has(.app.linux) { background: transparent; }
+@keyframes linux-vblank-damage { from { opacity: 0.25; } to { opacity: 0.95; } }
+.app.linux:not(.playing)::before,
+.app.linux.playing::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.012);
+  will-change: opacity;
+  animation: linux-vblank-damage 0.25s linear alternate infinite;
+}
+.app.linux:not(.playing)::after { content: ''; position: fixed; inset: 0; z-index: -2; pointer-events: none; background: #000; }
+.app.linux *, .app.linux *::before, .app.linux *::after { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
+.app.linux .ambient img, .app.linux .search-ambient img, .app.linux .theatre-glow { width: 100%; height: 100%; transform: none; will-change: auto; filter: none; opacity: .28; }
+.app.linux .tonight-logo { filter: none; }
+.panel { border-radius: 24px; padding: 28px 32px; display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+.panel p { margin: 0; }
+
+.app { position: relative; height: 100vh; padding-top: var(--top-inset); display: flex; flex-direction: column; outline: none; isolation: isolate; }
+.ambient { position: fixed; inset: -12%; /* also lights the status-bar strip */ z-index: -1; pointer-events: none; contain: strict; overflow: hidden; }
+/* Two stacked layers: the new light fades in over the old one (never a cut, never a dip to black). */
+.ambient img { position: absolute; top: 0; left: 0; width: 12.5%; height: 12.5%; object-fit: cover; transform-origin: 0 0; transform: scale(8) translateZ(0); will-change: opacity, transform; filter: blur(8px) saturate(150%) brightness(.5); animation: arrive .5s ease-out; }
+.ambient::after { content: ''; position: absolute; inset: 0; background: radial-gradient(ellipse at 30% 20%, rgba(0,0,0,0) 0%, rgba(0,0,0,.55) 70%, #000 100%); }
+.status-guard { position: fixed; top: 0; left: 0; right: 0; height: var(--top-inset); background: #000; z-index: 100; pointer-events: none; }
+.page { flex: 1; overflow-y: auto; overflow-x: hidden; padding-bottom: var(--bottom-inset); overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+
+/* ---------------------------------------------------------------- type */
+.display { font-family: var(--display); font-stretch: 82%; font-variation-settings: 'wdth' 82; letter-spacing: -0.01em; }
+.title { font-size: 34px; line-height: 1.02; font-weight: 650; margin: 0; }
+.section { font-size: 21px; line-height: 24px; font-weight: 600; letter-spacing: -0.1px; margin: 0; }
+.meta { font-size: 15px; line-height: 1.35; margin: 0; }
+.micro { font-size: 15px; line-height: 20px; font-weight: 600; margin: 0; }
+.body-strong { font-size: 17px; line-height: 23px; font-weight: 600; }
+.credit { font-size: 13px; }
+.dim { color: var(--dust); }
+/* Icons never take the artwork's accent: wrappers marked .lamp stay neutral. */
+.lamp { color: var(--bone); display: inline-grid; }
+.tnum { font-variant-numeric: tabular-nums; }
+.synopsis { font-size: 16px; line-height: 1.5; font-weight: 400; color: #d2d0cc; margin: 10px 0 0; max-width: 60ch; }
+.clamp-2 { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
+.clamp-2 { -webkit-line-clamp: 2; }
+.warn-icon { color: var(--amber); display: inline-grid; }
+.big-icon .icon { width: 30px; height: 30px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+:focus-visible { outline: 2px solid var(--lamp); outline-offset: 3px; }
+.app:focus-visible { outline: none; }
+
+/* ---------------------------------------------------------------- controls */
+.orb { display: inline-grid; place-items: center; flex: none; width: 48px; height: 48px; border-radius: 50%; color: var(--bone); transition: transform .12s, background-color .12s; }
+.orb .icon { width: 22px; height: 22px; }
+.orb.big { width: 56px; height: 56px; }
+.orb.big .icon { width: 24px; height: 24px; }
+.orb.small .icon { width: 19px; height: 19px; }
+.orb:not(.glass):not(.accent):hover { background: rgba(255,255,255,.1); }
+.orb.glass:hover { --glass-tint: color-mix(in srgb, var(--lamp) 14%, rgba(40,41,46,.5)); }
+.orb.accent { background: var(--lamp); color: #000; box-shadow: inset 0 1px 0 rgba(255,255,255,.45), 0 10px 28px color-mix(in srgb, var(--lamp) 30%, transparent); }
+.orb.on { background: var(--bone); color: #000; }
+.orb:disabled { opacity: .4; }
+.orb:focus-visible, .pill:focus-visible { outline: none; background: var(--bone); color: #000; transform: scale(1.06); }
+.orb:active:not(:disabled), .pill:active:not(:disabled) { transform: scale(.95); }
+
+.pill { display: inline-flex; align-items: center; gap: 8px; min-height: 48px; padding: 0 20px; border-radius: 24px; font-size: 16px; font-weight: 600; color: var(--bone); transition: transform .12s; }
+.pill .icon { width: 18px; height: 18px; }
+.pill.accent { background: var(--lamp); color: #000; box-shadow: inset 0 1px 0 rgba(255,255,255,.45), 0 10px 28px color-mix(in srgb, var(--lamp) 30%, transparent); }
+.pill.accent:disabled { opacity: .45; box-shadow: none; }
+.pill.static { cursor: default; padding: 0 16px; }
+
+/* ---------------------------------------------------------------- top bar */
+.topbar { position: absolute; top: var(--top-inset); left: 0; right: 0; z-index: 3; display: flex; align-items: center; gap: 20px; height: 84px; padding: 0 var(--gutter);
+  background: linear-gradient(180deg, rgba(0,0,0,.55), rgba(0,0,0,0)); pointer-events: none; }
+.topbar > * { pointer-events: auto; }
+/* Once the page scrolls under it, the bar gathers smoke behind it so the wordmark and the dock
+   never sit on posters; at the top of a page the artwork stays clear. */
+.topbar::before { content: ''; position: absolute; inset: 0 0 -32px; z-index: -1; pointer-events: none; opacity: 0; transition: opacity .18s ease;
+  background: linear-gradient(180deg, rgba(0,0,0,.84) 0%, rgba(0,0,0,.6) 60%, rgba(0,0,0,0) 100%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%); backdrop-filter: blur(14px) saturate(140%);
+  -webkit-mask-image: linear-gradient(180deg, #000 58%, transparent); mask-image: linear-gradient(180deg, #000 58%, transparent); }
+.scrolled .topbar::before { opacity: 1; }
+.wordmark { font-size: 24px; font-weight: 650; }
+.dock { display: flex; gap: 4px; padding: 5px; border-radius: 30px; margin-right: auto; }
+.dock-tab { display: inline-flex; align-items: center; gap: 8px; height: 48px; min-width: 48px; padding: 0 12px; border-radius: 24px; color: var(--dust); font-size: 15px; font-weight: 650; transition: background-color .2s, color .2s; }
+.dock-tab .icon { width: 22px; height: 22px; }
+.dock-tab:hover { color: var(--bone); }
+.dock-tab.on { color: var(--bone); background: rgba(255,255,255,.14); box-shadow: inset 0 1px 0 rgba(255,255,255,.18); padding: 0 16px 0 13px; }
+.dock-tab:focus-visible { outline: none; background: var(--bone); color: #000; }
+.dock-tab:focus-visible .icon { color: #000; }
+
+.center-note { display: grid; place-items: center; min-height: 70vh; padding: 96px var(--gutter) 40px; }
+
+/* ---------------------------------------------------------------- toasts */
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(24px + var(--bottom-inset)); z-index: 40; display: flex; align-items: center; gap: 12px;
+  min-height: 56px; padding: 4px 6px 4px 18px; border-radius: 28px; max-width: calc(100vw - 32px); animation: rise .2s ease-out; }
+.toast .icon { width: 20px; height: 20px; }
+.toast-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; max-width: 40ch; }
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: 16px; background: rgba(255,255,255,.1); color: var(--dust); font-size: 14px; font-weight: 650; }
+.chip .icon { width: 16px; height: 16px; }
+.chip.lit { color: #000; background: var(--lamp); }
+.chip.hw { color: #7be0a6; background: rgba(40, 199, 111, .16); }
+.chip.sw { color: var(--amber); background: rgba(232, 178, 58, .14); }
+.toast:has(.chip) { padding-right: 12px; }
+/* Another device asks for your keys: the question, then Share or Not now. */
+.keys-ask { padding: 10px 10px 10px 20px; gap: 14px; border-radius: 30px; max-width: min(760px, calc(100vw - 32px)); }
+.keys-ask-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.keys-ask-copy .toast-title { max-width: none; white-space: normal; }
+.keys-ask .pill { flex: none; }
+/* A new version (Windows, macOS, Android), stacked above the player status toast. */
+.update-toast { bottom: calc(96px + var(--bottom-inset)); z-index: 41; }
+@keyframes rise { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes arrive { from { opacity: 0; } to { opacity: 1; } }
+/* Quiet motion: artwork settles into place, words lift in after it, progress fills to where
+   you stopped. Long ease-outs, short distances; nothing loops. */
+@keyframes settle { from { opacity: 0; transform: scale(1.04); } to { opacity: 1; transform: none; } }
+@keyframes lift { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes fill-in { from { transform: scaleX(0); } }
+.card-progress > div { transform-origin: left; animation: fill-in .45s cubic-bezier(.22, 1, .36, 1) .08s both; }

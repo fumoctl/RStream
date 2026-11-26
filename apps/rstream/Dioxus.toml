@@ -1,0 +1,23 @@
+[application]
+name = "rstream"
+
+[bundle]
+identifier = "dev.rstream.app"
+publisher = "RStream"
+
+[android]
+min_sdk = 26
+compile_sdk = 36
+target_sdk = 36
+# dx 0.7.9 compiles Kotlin 2.0.x, which can't read a Kotlin 2.2 stdlib: pin the stdlib strictly.
+gradle_dependencies = [
+    "org.jetbrains.kotlin:kotlin-stdlib:2.0.21!!",
+]
+
+# Android TV: no touchscreen needed, and TV is supported without being required (banner: build.rs).
+[android.raw]
+manifest = """<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />"""

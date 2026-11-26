@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The RStream mark alone on transparency (adaptive foreground, monochrome, UI badge). -->
+  <path d="M518 524 L676 720" fill="none" stroke="#f2efea" stroke-opacity=".5" stroke-width="92" stroke-linecap="round"/>
+  <path d="M336 304 L336 720" fill="none" stroke="#f2efea" stroke-width="92" stroke-linecap="round"/>
+  <path d="M452 296 C452 266 485 248 510 264 L700 386 C724 401 724 435 700 450 L510 572 C485 588 452 570 452 540 Z" fill="#f2efea"/>
+</svg>

@@ -1,0 +1,160 @@
+/* Settings' add-on marketplace. */
+
+/* ---------------------------------------------------------------- add-on marketplace */
+.tab-dot { position: absolute; top: 8px; right: 8px; width: 9px; height: 9px; border-radius: 50%; background: var(--lamp); box-shadow: 0 0 0 2px rgba(0,0,0,.5); }
+.dock-tab { position: relative; }
+.link-btn { display: inline-flex; align-items: center; gap: 6px; min-height: 48px; padding: 0 8px; color: var(--bone); font-size: 14px; font-weight: 650; text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+.link-btn .icon { width: 16px; height: 16px; }
+.link-btn:focus-visible { outline: 2px solid var(--bone); border-radius: 12px; }
+.select-field { height: 48px; padding: 0 18px; border-radius: 24px; border: 0; outline: none; background: rgba(255,255,255,.08); color: var(--bone); font: inherit; font-weight: 600; }
+.select-field option { background: #1a1a1d; color: var(--bone); }
+.select-field:focus { box-shadow: inset 0 0 0 2px var(--bone); }
+.addon-problem { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(255,120,100,.12); color: #ffd2c8; font-size: 14.5px; }
+.addon-problem .icon { width: 18px; height: 18px; flex: none; }
+.settings-block .group-head .pill.small { min-height: 40px; padding: 0 14px; font-size: 14px; }
+.pill.small { min-height: 40px; padding: 0 14px; font-size: 14px; }
+.market { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 14px; }
+.market-card { display: flex; flex-direction: column; gap: 6px; padding: 20px 22px; border-radius: 22px; --glass: rgba(255,255,255,.05); }
+.market-card.on { box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1.5px rgba(242,239,234,.24), 0 12px 32px rgba(0,0,0,.28); }
+.market-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.market-name { font-size: 26px; font-weight: 700; }
+.market-version { font-size: 13.5px; }
+.market-about { margin: 0; color: #c9c7c3; font-size: 14.5px; line-height: 1.5; }
+.market-about.dim { color: var(--dust); font-size: 13.5px; }
+.market-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: auto; padding-top: 16px; }
+/* Installed is a state, not a button. */
+.market-status { display: inline-flex; align-items: center; gap: 8px; margin-right: auto; font-size: 15px; font-weight: 650; color: var(--bone); }
+.market-status .icon { width: 22px; height: 22px; padding: 4px; border-radius: 50%; background: var(--bone); color: #000; box-sizing: border-box; }
+.addon-row { align-items: center; }
+/* Add-ons Veylo doesn't set up: one quiet list, like the settings panels. */
+.addon-list { gap: 0; }
+.addon-row.glass { border-radius: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,.09); }
+.addon-row.glass:first-child { border-radius: 16px 16px 0 0; box-shadow: inset 0 1px 0 var(--sheen); }
+.addon-row.glass:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+@media (max-width: 640px) {
+  .setting-row { flex-wrap: wrap; }
+  .key-field, .select-field { width: 100%; }
+}
+.check-note { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(255,255,255,.06); color: var(--bone); font-size: 14.5px; }
+.check-note .icon { width: 18px; height: 18px; flex: none; }
+
+/* Settings → Account: the ways to sign in, the email form and the computer's QR code. */
+.account-choices { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.google-g { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 11px; background: #fff; color: #4285f4; font: 800 14px/1 system-ui, sans-serif; }
+.account-form { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; padding: 16px; border-radius: 20px; --glass: rgba(255,255,255,.045); }
+.account-form .key-field { width: 100%; max-width: 420px; }
+.account-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.account-note { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(120,220,150,.12); font-size: 14.5px; }
+.account-note .icon { width: 18px; height: 18px; flex: none; }
+.link-panel { flex-direction: row; align-items: center; gap: 22px; }
+.link-qr { width: 200px; height: 200px; flex: none; border-radius: 12px; background: #fff; }
+@media (max-width: 699px) { .link-panel { flex-direction: column; align-items: flex-start; } }
+
+/* Library filters, in-library search, history import and diagnostic log viewer. */
+.lib-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 20px; }
+.lib-filters { display: flex; flex-wrap: wrap; gap: 8px; }
+.lib-search { position: relative; display: flex; align-items: center; min-width: 220px; flex: 0 1 300px; }
+.lib-search input { width: 100%; height: 40px; padding: 0 36px 0 40px; border-radius: 20px; border: 1px solid rgba(255,255,255,.14);
+  background: rgba(255,255,255,.06); color: var(--bone); font: 500 14px/1 var(--ui); outline: none; -webkit-user-select: text; user-select: text; }
+.lib-search input:focus { border-color: color-mix(in srgb, var(--lamp) 60%, transparent); }
+.import-area { width: 100%; min-height: 110px; padding: 12px 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,.14);
+  background: rgba(0,0,0,.3); color: var(--bone); font: 500 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical;
+  box-sizing: border-box; -webkit-user-select: text; user-select: text; }
+.diag-log { margin: 12px 0 0; padding: 14px 16px; border-radius: 16px; max-height: 280px; overflow: auto;
+  font: 500 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dust); white-space: pre-wrap; word-break: break-word;
+  -webkit-user-select: text; user-select: text; }
+.diag-reports { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; max-height: 360px; overflow-y: auto; }
+.diag-report-item { padding: 12px 14px; border-radius: 14px; background: rgba(255,255,255,.04); display: flex; flex-direction: column; gap: 6px; }
+.diag-report-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.diag-report-summary { margin: 0; font-weight: 600; font-size: 14.5px; color: var(--bone); }
+.diag-report-detail { margin: 0; font-size: 12.5px; word-break: break-word; }
+
+/* Ephemeral RAM-Only Torrent Leak Tester (Settings -> Torrent & VPN killswitch). */
+.leak-card { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; padding: 18px 20px; border-radius: 20px;
+  background: rgba(14, 15, 22, .68); box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1px rgba(255,255,255,.09); }
+.leak-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.leak-title { font-size: 16px; font-weight: 700; color: var(--bone); }
+.leak-badge { display: inline-flex; align-items: center; height: 26px; padding: 0 12px; border-radius: 13px;
+  background: rgba(99, 108, 245, .16); color: #9ea8ff; box-shadow: inset 0 0 0 1px rgba(120, 132, 255, .36);
+  font-size: 12.5px; font-weight: 700; letter-spacing: .01em; }
+.leak-desc { margin: 0; font-size: 13.5px; line-height: 1.45; }
+.leak-input-wrap { position: relative; display: flex; align-items: center; }
+.leak-input { width: 100%; height: 48px; padding: 0 46px 0 16px; border-radius: 14px; border: 1px solid rgba(255,255,255,.14);
+  background: rgba(0,0,0,.38); color: var(--bone); font: 500 14.5px/1 var(--ui); outline: none; -webkit-user-select: text; user-select: text; }
+.leak-input:focus { border-color: #6b74f6; box-shadow: 0 0 0 2px rgba(107,116,246,.22); }
+.leak-paste { position: absolute; right: 10px; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; color: var(--dust); }
+.leak-paste:hover { color: var(--bone); background: rgba(255,255,255,.08); }
+.leak-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.leak-start.pill.accent { background: #636cf5; color: #fff; }
+.leak-start.pill.accent:hover:not(:disabled) { background: #747df8; }
+
+/* Interactive Rclone Remote Wizard + Crypt. */
+.rclone-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; padding: 6px; border-radius: 16px; --glass: rgba(14,15,22,.6); }
+.rclone-tab { min-height: 38px; padding: 0 16px; border-radius: 11px; font-size: 13.5px; font-weight: 700; color: var(--dust); }
+.rclone-tab:hover { color: var(--bone); background: rgba(255,255,255,.06); }
+.rclone-tab.on { background: #636cf5; color: #fff; }
+.rclone-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; padding: 6px; border-radius: 16px;
+  background: rgba(14,15,22,.55); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
+.rclone-mode-btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 16px; border-radius: 12px;
+  font-size: 14px; font-weight: 700; color: var(--dust); background: rgba(255,255,255,.02); }
+.rclone-mode-btn .icon { width: 17px; height: 17px; }
+.rclone-mode-btn:hover { color: var(--bone); background: rgba(255,255,255,.05); }
+.rclone-mode-btn.on { color: #fff; background: rgba(99,108,245,.22); box-shadow: inset 0 0 0 1.5px #636cf5; }
+.rclone-wizard { display: grid; grid-template-columns: minmax(250px, 340px) minmax(0, 1fr); gap: 16px; margin-top: 14px; align-items: start; }
+@media (max-width: 820px) {
+  .rclone-wizard { grid-template-columns: minmax(0, 1fr); }
+  .rclone-modes { grid-template-columns: minmax(0, 1fr); }
+}
+.rclone-cards { display: flex; flex-direction: column; gap: 10px; }
+.rclone-pcard { display: flex; flex-direction: column; gap: 6px; padding: 14px 16px; border-radius: 15px; text-align: left;
+  background: rgba(16,17,24,.72); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); transition: box-shadow .15s, background-color .15s; }
+.rclone-pcard:hover { background: rgba(28,30,44,.78); }
+.rclone-pcard.on { background: rgba(45,49,92,.36); box-shadow: inset 0 0 0 1.5px #6b74f6; }
+.rclone-pcard-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.rclone-pcard-title { font-size: 15px; font-weight: 700; color: var(--bone); }
+.rclone-pcard-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 9px; border-radius: 11px;
+  font-size: 11.5px; font-weight: 700; background: rgba(99,108,245,.18); color: #9ea8ff; white-space: nowrap; }
+.rclone-pcard-about { margin: 0; font-size: 12.5px; line-height: 1.4; color: var(--dust); }
+.rclone-form-card { display: flex; flex-direction: column; gap: 10px; padding: 20px 22px; border-radius: 18px;
+  background: rgba(14,15,22,.78); box-shadow: inset 0 0 0 1px rgba(255,255,255,.09); }
+.rclone-form-title { margin: 0 0 2px; font-size: 19px; font-weight: 750; color: var(--bone); }
+.rclone-connect-hint { margin: 0 0 4px; font-size: 13px; line-height: 1.45; color: #5ce1e6; }
+.rclone-label { font-size: 13px; font-weight: 650; color: #d5d7e0; margin-top: 2px; }
+.rclone-req { color: #ff9c8a; font-weight: 700; }
+.rclone-input { width: 100%; height: 44px; padding: 0 14px; border-radius: 12px; border: 1px solid rgba(255,255,255,.12);
+  background: rgba(0,0,0,.42); color: var(--bone); font: 500 13.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  box-sizing: border-box; outline: none; -webkit-user-select: text; user-select: text; }
+.rclone-input:focus { border-color: #6b74f6; }
+.rclone-secret-wrap { position: relative; display: flex; align-items: center; gap: 4px; }
+.rclone-secret-wrap .rclone-input { padding-right: 76px; }
+.rclone-icon-btn { position: absolute; right: 8px; display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; color: var(--dust); }
+.rclone-secret-wrap .rclone-icon-btn:nth-of-type(1):not(:last-of-type) { right: 40px; }
+.rclone-icon-btn:hover { color: var(--bone); background: rgba(255,255,255,.08); }
+.rclone-icon-btn .icon { width: 16px; height: 16px; }
+.rclone-subcard { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; padding: 14px 16px; border-radius: 14px;
+  background: rgba(40,44,82,.22); box-shadow: inset 0 0 0 1px rgba(107,116,246,.28); }
+.rclone-subcard-title { font-size: 13.5px; font-weight: 700; color: #9ea8ff; }
+.rclone-subcard-desc { margin: 0; font-size: 12.5px; line-height: 1.4; }
+.rclone-crypt-card { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; padding: 14px 16px; border-radius: 14px;
+  background: rgba(255,255,255,.03); box-shadow: inset 0 0 0 1px rgba(255,255,255,.09); }
+.rclone-crypt-card.on { background: rgba(26,58,48,.22); box-shadow: inset 0 0 0 1px rgba(46,204,143,.35); }
+.rclone-crypt-head { display: flex; align-items: center; gap: 12px; }
+.rclone-crypt-lock { color: #2ecc8f; display: grid; place-items: center; flex: none; }
+.rclone-crypt-copy { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.rclone-crypt-title { font-size: 13.5px; font-weight: 700; color: var(--bone); }
+.rclone-crypt-desc { font-size: 12px; line-height: 1.38; }
+.rclone-crypt-fields { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; }
+.rclone-switch { position: relative; width: 48px; height: 28px; border-radius: 14px; flex: none; padding: 3px;
+  background: rgba(255,255,255,.16); transition: background-color .18s; }
+.rclone-switch.on { background: #2ecc8f; }
+.rclone-switch-knob { display: block; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform .18s; }
+.rclone-switch.on .rclone-switch-knob { transform: translateX(20px); }
+.rclone-submit { margin-top: 6px; height: 44px; width: 100%; border-radius: 22px; font-size: 14.5px; font-weight: 700;
+  background: #636cf5; color: #fff; transition: background-color .15s, opacity .15s; }
+.rclone-submit:hover:not(:disabled) { background: #747df8; }
+.rclone-submit:disabled { opacity: .45; cursor: default; }
+.rclone-two-inputs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 640px) { .rclone-two-inputs { grid-template-columns: minmax(0, 1fr); } }
+.rclone-col { display: flex; flex-direction: column; gap: 6px; }
+.rclone-opt-field { display: flex; flex-direction: column; gap: 4px; }
+.rclone-opt-help { font-size: 12px; line-height: 1.35; }

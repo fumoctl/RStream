@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360">
+  <!-- Android TV launcher banner (320x180 dp @ xhdpi = 640x360): RStream mark and wordmark on warm black. -->
+  <defs>
+    <radialGradient id="bg" cx="0.2" cy="0.12" r="1.05">
+      <stop offset="0" stop-color="#292621"/>
+      <stop offset="0.55" stop-color="#0d0c0b"/>
+      <stop offset="1" stop-color="#000000"/>
+    </radialGradient>
+  </defs>
+  <rect width="640" height="360" fill="url(#bg)"/>
+  <g transform="translate(64 84) scale(0.37) translate(-290 -258)">
+    <path d="M518 524 L676 720" fill="none" stroke="#f2efea" stroke-opacity=".5" stroke-width="92" stroke-linecap="round"/>
+    <path d="M336 304 L336 720" fill="none" stroke="#f2efea" stroke-width="92" stroke-linecap="round"/>
+    <path d="M452 296 C452 266 485 248 510 264 L700 386 C724 401 724 435 700 450 L510 572 C485 588 452 570 452 540 Z" fill="#f2efea"/>
+  </g>
+  <text x="236" y="214" font-family="Archivo, sans-serif" font-weight="700" font-size="88" letter-spacing="-1.5" fill="#f2efea">RStream</text>
+</svg>

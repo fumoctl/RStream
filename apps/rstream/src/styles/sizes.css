@@ -1,0 +1,70 @@
+/* Smaller windows and touch screens: what changes below each width. */
+
+/* ---------------------------------------------------------------- sizes */
+@media (max-width: 999px) { .card { width: 140px; } }
+@media (max-width: 899px) { :root { --gutter: 40px; } }
+@media (max-width: 760px) {
+  :root { --gutter: 20px; }
+  .topbar { gap: 10px; }
+  .wordmark { display: none; }
+  .dock-tab.on span { display: none; }
+  .dock-tab.on { padding: 0 12px; }
+  .strip .poster { width: 112px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 18px 12px; }
+  .top-match { flex-direction: column; }
+  .top-art { inset: 0; }
+  .search-field { height: 60px; padding-left: 18px; }
+  .ep-still { width: 128px; }
+  .ep-overview { display: none; }
+  .title-hero { min-height: 520px; }
+  .source-details { padding-left: 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+/* "Already watched": one switch on films and per season; a check per episode. */
+.watched-switch { gap: 10px; color: var(--dust); }
+.watched-switch.on { color: var(--bone); box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1.5px var(--bone); }
+.episodes-block > .watched-switch { align-self: flex-start; margin: 4px 0 10px; }
+.ep-seen { color: var(--faint, rgba(255,255,255,.35)); }
+.ep-seen.on { color: #000; }
+.ep-seen.on .icon { background: var(--bone); border-radius: 50%; padding: 3px; box-sizing: content-box; }
+
+/* Press: the control sinks and brightens, then springs back on release. Large surfaces only
+   give a little; keyboard focus keeps its visible ring. */
+.orb, .pill, .seg, .chip-btn, .dock-tab, .option, .name-chip, .ep-seen {
+  transition: transform .18s cubic-bezier(.22, 1, .36, 1), filter .14s ease, background-color .12s, color .12s;
+}
+.orb:active:not(:disabled), .pill:active:not(:disabled), .seg:active, .chip-btn:active, .dock-tab:active, .option:active, .name-chip:active {
+  transform: scale(.92); filter: brightness(1.25); transition-duration: .06s;
+}
+.card, .ep-main, .week-open, .duel-hit, .source-main, .demo-row { transition: transform .18s cubic-bezier(.22, 1, .36, 1); }
+.card:active, .ep-main:active:not(:disabled), .week-open:active, .source-main:active, .demo-row:active { transform: scale(.975); transition-duration: .06s; }
+
+/* Library: remove a title (and its history). Quiet until wanted. */
+.lib-item { position: relative; min-width: 0; }
+/* A button inside a plain div shrinks to its content: the card must fill its grid cell. */
+.lib-item .card { width: 100%; }
+.forget { position: absolute; z-index: 3; display: flex; gap: 8px; align-items: center; transition: opacity .18s ease; }
+.forget .orb { width: 36px; height: 36px; }
+.forget .orb.glass { --glass-tint: rgba(8,8,10,.62); }
+.forget .orb .icon { width: 17px; height: 17px; }
+.forget-confirm { min-height: 36px; height: 36px; padding: 0 14px; gap: 6px; color: #fff; background: rgba(200,48,48,.92);
+  box-shadow: 0 6px 20px rgba(0,0,0,.35); font-size: 14px; }
+.forget-confirm .icon { width: 16px; height: 16px; }
+/* Asking before Picks forgets: the same red as removing a title, at the size of its row. */
+.confirm { display: inline-flex; align-items: center; gap: 8px; animation: arrive .14s ease-out; }
+.confirm .forget-confirm { height: 48px; min-height: 48px; padding: 0 18px; font-size: 15px; }
+.chips .confirm .forget-confirm { height: 56px; min-height: 56px; border-radius: 28px; }
+/* Week cards: top right corner is free. */
+.week-card .forget { top: 12px; right: 12px; }
+/* Posters: top left (the watched tick owns top right); asking covers the poster. */
+.lib-item .forget { top: 6px; left: 6px; }
+.lib-item .forget.armed { top: 0; left: 0; right: 0; aspect-ratio: 2 / 3; flex-direction: column; justify-content: center;
+  border-radius: 8px; background: rgba(0,0,0,.66); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+@media (hover: hover) {
+  .forget:not(.armed) { opacity: 0; }
+  .week-card:hover .forget, .lib-item:hover .forget, .forget:focus-within { opacity: 1; }
+}
+@media (hover: none) { .forget:not(.armed) { opacity: .9; } }

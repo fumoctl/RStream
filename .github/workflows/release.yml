@@ -1,0 +1,278 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for manual test artifacts (e.g. v0.1.0)"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  GOTOOLCHAIN: auto
+
+jobs:
+  linux-appimage:
+    name: Linux AppImage (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            ver="${GITHUB_REF_NAME}"
+          else
+            ver="${INPUT_VERSION:-v0.1.0}"
+          fi
+          if [[ ! "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z._-]+)?$ ]]; then
+            echo "Invalid version label: $ver" >&2
+            exit 1
+          fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config patchelf desktop-file-utils file wget curl xvfb \
+            librsvg2-bin glib-networking \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libmpv-dev libxdo-dev \
+            libayatana-appindicator3-dev libdbusmenu-gtk3-dev
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/librclone/go.mod
+          cache-dependency-path: tools/librclone/go.sum
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+
+      - name: Build librclone & self-contained AppImage (${{ matrix.arch }})
+        env:
+          RSTREAM_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          chmod +x tools/build-librclone.sh tools/package-appimage.sh
+          ./tools/build-librclone.sh linux
+          ./tools/package-appimage.sh
+          test -x "dist/RStream-${RSTREAM_VERSION}-${{ matrix.arch }}.AppImage"
+          "./dist/RStream-${RSTREAM_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract-and-run --self-test
+          gui_log="$(mktemp)"
+          timeout --preserve-status -s TERM 5s xvfb-run -a -s "-screen 0 1280x720x24" \
+            "./dist/RStream-${RSTREAM_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract-and-run >"$gui_log" 2>&1 || true
+          cat "$gui_log"
+          ! grep -E "Unable to spawn a new child process|Failed to spawn child process" "$gui_log"
+          # Smoke-test GUI + WebKitNetworkProcess relocation when host /usr/lib/*/webkit2gtk-4.1 is hidden.
+          sudo mv "/usr/lib/$(uname -m)-linux-gnu/webkit2gtk-4.1" "/usr/lib/$(uname -m)-linux-gnu/webkit2gtk-4.1.hidden"
+          gui_log="$(mktemp)"
+          timeout --preserve-status -s TERM 4s xvfb-run -a -s "-screen 0 1280x720x24" \
+            "./dist/RStream-${RSTREAM_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract-and-run >"$gui_log" 2>&1 || true
+          sudo mv "/usr/lib/$(uname -m)-linux-gnu/webkit2gtk-4.1.hidden" "/usr/lib/$(uname -m)-linux-gnu/webkit2gtk-4.1"
+          cat "$gui_log"
+          ! grep -E "Failed to spawn child process|WebKitNetworkProcess.*No such file" "$gui_log"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage-${{ matrix.arch }}
+          path: dist/RStream-*-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+
+  android-universal-apk:
+    name: Android Universal APK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            ver="${GITHUB_REF_NAME}"
+          else
+            ver="${INPUT_VERSION:-v0.1.0}"
+          fi
+          if [[ ! "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z._-]+)?$ ]]; then
+            echo "Invalid version label: $ver" >&2
+            exit 1
+          fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK 36 & NDK 28 (16 KB page support)
+        run: |
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmgr="$(ls -1d "$sdk_root"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)"
+          yes | "$sdkmgr" --sdk_root="$sdk_root" --licenses >/dev/null || true
+          "$sdkmgr" --sdk_root="$sdk_root" "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          {
+            echo "ANDROID_HOME=${sdk_root}"
+            echo "ANDROID_SDK_ROOT=${sdk_root}"
+            echo "ANDROID_NDK_HOME=${sdk_root}/ndk/28.2.13676358"
+          } >> "$GITHUB_ENV"
+          echo "${sdk_root}/platform-tools" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/librclone/go.mod
+          cache-dependency-path: tools/librclone/go.sum
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-universal
+
+      - name: Install dioxus-cli 0.7.10
+        uses: taiki-e/install-action@v2
+        with:
+          tool: dioxus-cli@0.7.10
+
+      - name: Fetch mpv-android, build librclone & package Universal APK
+        env:
+          RSTREAM_VERSION: ${{ steps.meta.outputs.version }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x tools/fetch-mpv-android.sh tools/build-librclone.sh tools/package-android-apk.sh
+          ./tools/fetch-mpv-android.sh
+          ./tools/build-librclone.sh android
+          ./tools/package-android-apk.sh
+          test -f "dist/RStream-${RSTREAM_VERSION}-universal.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-universal-apk
+          path: dist/RStream-*-universal.apk
+          if-no-files-found: error
+
+  windows-portable-exe:
+    name: Windows Portable Self-Extracting EXE (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            ver="${GITHUB_REF_NAME}"
+          else
+            ver="${INPUT_VERSION:-v0.1.0}"
+          fi
+          if [[ ! "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z._-]+)?$ ]]; then
+            echo "Invalid version label: $ver" >&2
+            exit 1
+          fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/librclone/go.mod
+          cache-dependency-path: tools/librclone/go.sum
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+
+      - name: Build librclone.dll
+        shell: bash
+        run: |
+          export PATH="/c/msys64/mingw64/bin:$PATH"
+          ./tools/build-librclone.sh windows
+
+      - name: Fetch pinned libmpv-2.dll
+        shell: pwsh
+        run: ./apps/rstream/windows/fetch-mpv.ps1
+
+      - name: Build release binaries & self-extracting portable .exe
+        shell: bash
+        env:
+          RSTREAM_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cargo test -p rstream-portable-sfx
+          cargo build --release -p rstream -p rstream-portable-sfx
+          ./target/release/rstream.exe --self-test
+          mkdir -p dist
+          python tools/pack-windows-portable.py \
+            target/release/rstream-portable-sfx.exe \
+            "dist/RStream-${RSTREAM_VERSION}-windows-x86_64.exe" \
+            target/release/rstream.exe \
+            apps/rstream/windows/mpv/libmpv-2.dll \
+            vendor/librclone/windows-x86_64/librclone.dll \
+            target/release/vulkan-1.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable-exe
+          path: dist/RStream-*-windows-x86_64.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - linux-appimage
+      - android-universal-apk
+      - windows-portable-exe
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd dist
+          sha256sum RStream-* | tee SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/RStream-*-x86_64.AppImage
+            dist/RStream-*-aarch64.AppImage
+            dist/RStream-*-universal.apk
+            dist/RStream-*-windows-x86_64.exe
+            dist/SHA256SUMS.txt

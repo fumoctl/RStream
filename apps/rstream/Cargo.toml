@@ -1,0 +1,49 @@
+[package]
+name = "rstream"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+getrandom = "0.3"
+dioxus = { version = "=0.7.10", features = ["desktop"] }
+rustmedia-core = { path = "../../crates/core" }
+rustmedia-media-proxy = { path = "../../crates/media-proxy" }
+rstream-rclone = { path = "../../crates/rclone" }
+stremio-torrent = { path = "../../crates/torrent" }
+rstream-mpv-config = { path = "../../crates/mpv-config" }
+tokio-util = "0.7"
+regex = "1"
+anyhow = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "net", "io-util"] }
+unicode-normalization = "0.1"
+sha2 = "0.10"
+url = "2"
+libmpv2 = { version = "7.0.1", default-features = false }
+libmpv2-sys = "4.0.1"
+libc = "0.2"
+veylo-picture-check = { path = "../../crates/picture-check" }
+
+[build-dependencies]
+embed-resource = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+veylo-video-surface = { path = "../../crates/video-surface" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+ndk-context = "0.1.1"

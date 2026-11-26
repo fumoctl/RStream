@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/media-proxy",
+    "crates/video-surface",
+    "crates/picture-check",
+    "crates/rclone",
+    "crates/torrent",
+    "crates/mpv-config",
+    "crates/portable-sfx",
+    "apps/rstream",
+]
+
+[workspace.package]
+license = "AGPL-3.0-or-later"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
