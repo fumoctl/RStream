@@ -12,7 +12,7 @@
 ---
 
 > [!WARNING]
-> **VPN killswitch and interface-binding support is still experimental — when privacy is required, verify your system or router VPN setup independently or use direct HTTPS media sources.**
+> **VPN killswitch and interface-binding support is still experimental.**
 
 ---
 
