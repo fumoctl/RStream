@@ -5074,7 +5074,7 @@ dependencies = [
 
 [[package]]
 name = "rstream"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5109,7 +5109,7 @@ dependencies = [
 
 [[package]]
 name = "rstream-mpv-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -5117,7 +5117,7 @@ dependencies = [
 
 [[package]]
 name = "rstream-portable-sfx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "embed-resource",
  "flate2",
@@ -5126,7 +5126,7 @@ dependencies = [
 
 [[package]]
 name = "rstream-rclone"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -5260,7 +5260,7 @@ dependencies = [
 
 [[package]]
 name = "rustmedia-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -5273,7 +5273,7 @@ dependencies = [
 
 [[package]]
 name = "rustmedia-media-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -5769,7 +5769,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stremio-torrent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fs2",
@@ -6577,11 +6577,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veylo-picture-check"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "veylo-video-surface"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gtk",
  "libc",
