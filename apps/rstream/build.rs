@@ -118,11 +118,63 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dest_ca.display());
 }
 
+fn rustls_platform_verifier_android_version(lock_path: &Path) -> String {
+    let lock = std::fs::read_to_string(lock_path)
+        .unwrap_or_else(|e| panic!("read {} for rustls-platform-verifier-android: {e}", lock_path.display()));
+    let mut in_pkg = false;
+    for line in lock.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            in_pkg = false;
+        } else if t == r#"name = "rustls-platform-verifier-android""# {
+            in_pkg = true;
+        } else if in_pkg {
+            if let Some(ver) = t.strip_prefix("version = \"").and_then(|s| s.strip_suffix('"')) {
+                if !ver.is_empty() {
+                    return ver.to_owned();
+                }
+            }
+        }
+    }
+    panic!(
+        "rustls-platform-verifier-android version missing in {}",
+        lock_path.display()
+    );
+}
+
 fn pin_installed_build_tools(main_dir: &Path) {
     let Some(app_dir) = main_dir.parent().and_then(Path::parent) else { return };
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let lock_path = manifest_dir.join("../../Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    let verifier_ver = rustls_platform_verifier_android_version(&lock_path);
+
+    if let Some(root_gradle) = app_dir.parent().map(|p| p.join("build.gradle.kts")) {
+        if let Ok(root_raw) = std::fs::read_to_string(&root_gradle) {
+            if !root_raw.contains("rustls-platform-verifier") {
+                if let Some(all_pos) = root_raw.find("allprojects") {
+                    if let Some(mc_rel) = root_raw[all_pos..].find("mavenCentral()") {
+                        let insert_at = all_pos + mc_rel + "mavenCentral()".len();
+                        let mut root_patched = String::with_capacity(root_raw.len() + 140);
+                        root_patched.push_str(&root_raw[..insert_at]);
+                        root_patched.push_str(
+                            "\n        maven { url = uri(\"https://raw.githubusercontent.com/rustls/rustls-platform-verifier/maven-archive/android-release-support/maven/\") }",
+                        );
+                        root_patched.push_str(&root_raw[insert_at..]);
+                        let _ = std::fs::write(&root_gradle, root_patched);
+                    }
+                }
+            }
+        }
+    }
+
     let gradle = app_dir.join("build.gradle.kts");
     let Ok(raw) = std::fs::read_to_string(&gradle) else { return };
-    let text = raw.replace("targetSdk = 35", "targetSdk = 36");
+    let mut text = raw.replace("targetSdk = 35", "targetSdk = 36");
+    if !text.contains("org.rustls:rustls-platform-verifier") {
+        let dep_line = format!("implementation(\"org.rustls:rustls-platform-verifier:{verifier_ver}\")");
+        text = text.replacen("dependencies {\n", &format!("dependencies {{\n    {dep_line}\n"), 1);
+    }
     if text.contains("buildToolsVersion") {
         if text != raw {
             let _ = std::fs::write(&gradle, text);
@@ -137,7 +189,12 @@ fn pin_installed_build_tools(main_dir: &Path) {
         return;
     };
     let bt_dir = Path::new(&sdk).join("build-tools");
-    let Ok(entries) = std::fs::read_dir(&bt_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&bt_dir) else {
+        if text != raw {
+            let _ = std::fs::write(&gradle, text);
+        }
+        return;
+    };
     let mut versions: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
@@ -152,7 +209,12 @@ fn pin_installed_build_tools(main_dir: &Path) {
         };
         nums(a).cmp(&nums(b)).then_with(|| a.cmp(b))
     });
-    let Some(ver) = versions.last() else { return };
+    let Some(ver) = versions.last() else {
+        if text != raw {
+            let _ = std::fs::write(&gradle, text);
+        }
+        return;
+    };
     let mut out = String::with_capacity(text.len() + 64);
     let mut patched = false;
     for line in text.lines() {
@@ -242,6 +304,7 @@ fn tv_launcher(manifest: &Path) {
         patched = patched.replacen("<activity ", "<activity android:launchMode=\"singleTask\" ", 1);
     }
     for perm in [
+        "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
         "android.permission.POST_NOTIFICATIONS",

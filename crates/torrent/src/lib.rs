@@ -85,8 +85,22 @@ pub struct VpnPolicy {
     pub bind_interface: Option<String>,
 }
 
-static ANDROID_VPN_STATE: StdMutex<(bool, Option<String>, u64, Vec<IpAddr>)> =
-    StdMutex::new((false, None, 0, Vec::new()));
+#[derive(Default)]
+struct AndroidVpnSnapshot {
+    active: bool,
+    iface: Option<String>,
+    net_handle: u64,
+    addrs: Vec<String>,
+    dns_servers: Vec<IpAddr>,
+}
+
+static ANDROID_VPN_STATE: StdMutex<AndroidVpnSnapshot> = StdMutex::new(AndroidVpnSnapshot {
+    active: false,
+    iface: None,
+    net_handle: 0,
+    addrs: Vec::new(),
+    dns_servers: Vec::new(),
+});
 static ANDROID_VPN_WATCHERS: StdMutex<Vec<(VpnPolicy, u64, CancellationToken)>> =
     StdMutex::new(Vec::new());
 
@@ -96,7 +110,7 @@ static TEST_INTERFACES_OVERRIDE: StdMutex<Option<Vec<NetworkInterface>>> = StdMu
 static TEST_BOUND_DNS_SERVER: StdMutex<Option<SocketAddr>> = StdMutex::new(None);
 
 pub fn set_android_vpn_state(active: bool, iface_name: Option<String>) {
-    set_android_vpn_state_full(active, iface_name, 0, Vec::new());
+    set_android_vpn_state_with_addrs(active, iface_name, 0, Vec::new(), Vec::new());
 }
 
 pub fn set_android_vpn_state_with_handle(
@@ -104,7 +118,7 @@ pub fn set_android_vpn_state_with_handle(
     iface_name: Option<String>,
     net_handle: u64,
 ) {
-    set_android_vpn_state_full(active, iface_name, net_handle, Vec::new());
+    set_android_vpn_state_with_addrs(active, iface_name, net_handle, Vec::new(), Vec::new());
 }
 
 fn is_usable_dns_server_ip(ip: IpAddr) -> bool {
@@ -114,10 +128,39 @@ fn is_usable_dns_server_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn filter_usable_android_addrs(link_addrs: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in link_addrs {
+        let trimmed = raw.split('/').next().unwrap_or(&raw).trim();
+        let usable = match trimmed.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => !v4.is_loopback() && !v4.is_unspecified(),
+            Ok(IpAddr::V6(v6)) => is_global_unicast_v6(v6),
+            Err(_) => false,
+        };
+        if usable {
+            let normalized = trimmed.to_owned();
+            if !out.contains(&normalized) {
+                out.push(normalized);
+            }
+        }
+    }
+    out
+}
+
 pub fn set_android_vpn_state_full(
     active: bool,
     iface_name: Option<String>,
     net_handle: u64,
+    dns_servers: Vec<IpAddr>,
+) {
+    set_android_vpn_state_with_addrs(active, iface_name, net_handle, Vec::new(), dns_servers);
+}
+
+pub fn set_android_vpn_state_with_addrs(
+    active: bool,
+    iface_name: Option<String>,
+    net_handle: u64,
+    link_addrs: Vec<String>,
     dns_servers: Vec<IpAddr>,
 ) {
     let iface = iface_name.and_then(|s| {
@@ -125,6 +168,11 @@ pub fn set_android_vpn_state_full(
         (!t.is_empty()).then(|| t.to_owned())
     });
     let effective_handle = if active { net_handle } else { 0 };
+    let filtered_addrs = if active {
+        filter_usable_android_addrs(link_addrs)
+    } else {
+        Vec::new()
+    };
     let filtered_dns: Vec<IpAddr> = if active {
         dns_servers
             .into_iter()
@@ -134,7 +182,13 @@ pub fn set_android_vpn_state_full(
         Vec::new()
     };
     if let Ok(mut guard) = ANDROID_VPN_STATE.lock() {
-        *guard = (active, iface.clone(), effective_handle, filtered_dns);
+        *guard = AndroidVpnSnapshot {
+            active,
+            iface: iface.clone(),
+            net_handle: effective_handle,
+            addrs: filtered_addrs,
+            dns_servers: filtered_dns,
+        };
     }
     if let Ok(mut watchers) = ANDROID_VPN_WATCHERS.lock() {
         watchers.retain(|(policy, expected_handle, token)| {
@@ -159,18 +213,25 @@ pub fn set_android_vpn_state_full(
 pub fn android_vpn_state() -> (bool, Option<String>) {
     ANDROID_VPN_STATE
         .lock()
-        .map(|g| (g.0, g.1.clone()))
+        .map(|g| (g.active, g.iface.clone()))
         .unwrap_or((false, None))
 }
 
 pub fn android_vpn_network_handle() -> u64 {
-    ANDROID_VPN_STATE.lock().map(|g| g.2).unwrap_or(0)
+    ANDROID_VPN_STATE.lock().map(|g| g.net_handle).unwrap_or(0)
+}
+
+pub fn android_vpn_addrs() -> Vec<String> {
+    ANDROID_VPN_STATE
+        .lock()
+        .map(|g| g.addrs.clone())
+        .unwrap_or_default()
 }
 
 pub fn android_vpn_dns_servers() -> Vec<IpAddr> {
     ANDROID_VPN_STATE
         .lock()
-        .map(|g| g.3.clone())
+        .map(|g| g.dns_servers.clone())
         .unwrap_or_default()
 }
 
@@ -221,83 +282,114 @@ pub fn list_interfaces() -> Vec<NetworkInterface> {
     }
 
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `head` is a valid out-pointer for `getifaddrs`.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
-        return Vec::new();
-    }
-    let _guard = IfAddrsGuard(head);
+    #[allow(unused_mut)]
+    let mut ifaces: Vec<NetworkInterface> = if unsafe { libc::getifaddrs(&mut head) } == 0
+        && !head.is_null()
+    {
+        let _guard = IfAddrsGuard(head);
 
-    let mut map: BTreeMap<String, (u32, Vec<String>)> = BTreeMap::new();
-    let mut cur = head;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a non-null node in the `getifaddrs` linked list until `freeifaddrs`.
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_name.is_null() {
-            continue;
+        let mut map: BTreeMap<String, (u32, Vec<String>)> = BTreeMap::new();
+        let mut cur = head;
+        while !cur.is_null() {
+            // SAFETY: `cur` is a non-null node in the `getifaddrs` linked list until `freeifaddrs`.
+            let ifa = unsafe { &*cur };
+            cur = ifa.ifa_next;
+            if ifa.ifa_name.is_null() {
+                continue;
+            }
+            // SAFETY: `ifa_name` is a NUL-terminated C string when non-null.
+            let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            if name.is_empty() {
+                continue;
+            }
+            #[allow(clippy::unnecessary_cast)]
+            let flags = ifa.ifa_flags as u32;
+            let entry = map.entry(name).or_insert((0, Vec::new()));
+            entry.0 |= flags;
+
+            if !ifa.ifa_addr.is_null() {
+                // SAFETY: `ifa_addr` is non-null and points to a `sockaddr` header.
+                let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
+                let ip = match family {
+                    libc::AF_INET => {
+                        // SAFETY: `sa_family == AF_INET` guarantees `sockaddr_in` layout.
+                        let sin = unsafe {
+                            std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in>())
+                        };
+                        let v4 = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                        (!v4.is_loopback() && !v4.is_unspecified()).then(|| v4.to_string())
+                    }
+                    libc::AF_INET6 => {
+                        // SAFETY: `sa_family == AF_INET6` guarantees `sockaddr_in6` layout.
+                        let sin6 = unsafe {
+                            std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in6>())
+                        };
+                        let v6 = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                        is_global_unicast_v6(v6).then(|| v6.to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(ip) = ip {
+                    if !entry.1.contains(&ip) {
+                        entry.1.push(ip);
+                    }
+                }
+            }
         }
-        // SAFETY: `ifa_name` is a NUL-terminated C string when non-null.
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
-        if name.is_empty() {
-            continue;
-        }
+
         #[allow(clippy::unnecessary_cast)]
-        let flags = ifa.ifa_flags as u32;
-        let entry = map.entry(name).or_insert((0, Vec::new()));
-        entry.0 |= flags;
+        let iff_loopback = libc::IFF_LOOPBACK as u32;
+        #[allow(clippy::unnecessary_cast)]
+        let iff_up = libc::IFF_UP as u32;
+        #[allow(clippy::unnecessary_cast)]
+        let iff_running = libc::IFF_RUNNING as u32;
 
-        if !ifa.ifa_addr.is_null() {
-            // SAFETY: `ifa_addr` is non-null and points to a `sockaddr` header.
-            let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
-            let ip = match family {
-                libc::AF_INET => {
-                    // SAFETY: `sa_family == AF_INET` guarantees `sockaddr_in` layout.
-                    let sin = unsafe {
-                        std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in>())
-                    };
-                    let v4 = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    (!v4.is_loopback() && !v4.is_unspecified()).then(|| v4.to_string())
+        map.into_iter()
+            .filter(|(name, (flags, _))| (*flags & iff_loopback) == 0 && name != "lo")
+            .map(|(name, (flags, addrs))| {
+                let is_up = (flags & iff_up) != 0 && ((flags & iff_running) != 0 || !addrs.is_empty());
+                let is_vpn_like = is_vpn_interface_name(&name);
+                NetworkInterface {
+                    name,
+                    addrs,
+                    is_up,
+                    is_vpn_like,
                 }
-                libc::AF_INET6 => {
-                    // SAFETY: `sa_family == AF_INET6` guarantees `sockaddr_in6` layout.
-                    let sin6 = unsafe {
-                        std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in6>())
-                    };
-                    let v6 = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                    is_global_unicast_v6(v6).then(|| v6.to_string())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    #[cfg(target_os = "android")]
+    {
+        // Android 11+ SELinux blocks netlink getifaddrs() on targetSdk >= 30; merge ConnectivityManager VPN state.
+        let (active, vpn_iface) = android_vpn_state();
+        if active {
+            let name = vpn_iface.unwrap_or_else(|| "tun0".into());
+            let addrs = android_vpn_addrs();
+            if let Some(existing) = ifaces.iter_mut().find(|i| i.name == name) {
+                existing.is_up = true;
+                existing.is_vpn_like = true;
+                for addr in addrs {
+                    if !existing.addrs.contains(&addr) {
+                        existing.addrs.push(addr);
+                    }
                 }
-                _ => None,
-            };
-            if let Some(ip) = ip {
-                if !entry.1.contains(&ip) {
-                    entry.1.push(ip);
-                }
+            } else {
+                ifaces.push(NetworkInterface {
+                    name,
+                    addrs,
+                    is_up: true,
+                    is_vpn_like: true,
+                });
             }
         }
     }
 
-    #[allow(clippy::unnecessary_cast)]
-    let iff_loopback = libc::IFF_LOOPBACK as u32;
-    #[allow(clippy::unnecessary_cast)]
-    let iff_up = libc::IFF_UP as u32;
-    #[allow(clippy::unnecessary_cast)]
-    let iff_running = libc::IFF_RUNNING as u32;
-
-    map.into_iter()
-        .filter(|(name, (flags, _))| (*flags & iff_loopback) == 0 && name != "lo")
-        .map(|(name, (flags, addrs))| {
-            let is_up = (flags & iff_up) != 0 && ((flags & iff_running) != 0 || !addrs.is_empty());
-            let is_vpn_like = is_vpn_interface_name(&name);
-            NetworkInterface {
-                name,
-                addrs,
-                is_up,
-                is_vpn_like,
-            }
-        })
-        .collect()
+    ifaces
 }
 
 #[cfg(windows)]
@@ -738,12 +830,20 @@ fn resolve_vpn_binding(policy: &VpnPolicy) -> Result<VpnBinding> {
         }
         let net_handle = android_vpn_network_handle();
         let dns_servers = android_vpn_dns_servers();
-        let ifaces = current_interfaces();
-        let (ipv4, ipv6) = current_iface
-            .as_deref()
-            .and_then(|name| ifaces.iter().find(|i| i.name == name))
-            .map(|i| extract_first_v4_and_global_v6(&i.addrs))
-            .unwrap_or((None, None));
+        let (mut ipv4, mut ipv6) = extract_first_v4_and_global_v6(&android_vpn_addrs());
+        if ipv4.is_none() && ipv6.is_none() {
+            let ifaces = current_interfaces();
+            (ipv4, ipv6) = current_iface
+                .as_deref()
+                .and_then(|name| ifaces.iter().find(|i| i.name == name))
+                .map(|i| extract_first_v4_and_global_v6(&i.addrs))
+                .unwrap_or((None, None));
+        }
+        ensure!(
+            ipv4.is_some() || ipv6.is_some(),
+            "VPN killswitch blocked torrent: active Android VPN '{}' has no usable tunnel address",
+            current_iface.as_deref().unwrap_or("tunnel")
+        );
         return Ok(VpnBinding::AndroidNetwork {
             iface: current_iface,
             net_handle,
@@ -823,7 +923,7 @@ fn spawn_vpn_watcher(
 }
 
 #[cfg(target_os = "android")]
-fn bind_fd_to_android_network(fd: libc::c_int, net_handle: u64) -> Result<()> {
+fn bind_fd_to_android_network(fd: libc::c_int, net_handle: u64) -> Result<bool> {
     #[link(name = "android")]
     extern "C" {
         fn android_setsocknetwork(network: u64, fd: libc::c_int) -> libc::c_int;
@@ -832,38 +932,66 @@ fn bind_fd_to_android_network(fd: libc::c_int, net_handle: u64) -> Result<()> {
     // SAFETY: `fd` is an open socket file descriptor owned by the caller and `net_handle`
     // comes from `android.net.Network.getNetworkHandle()`.
     let rc = unsafe { android_setsocknetwork(net_handle, fd) };
-    if rc != 0 {
-        let err = std::io::Error::from_raw_os_error(if rc < 0 { -rc } else { rc });
-        return Err(err).context("android_setsocknetwork failed");
+    if rc == 0 {
+        return Ok(true);
     }
-    Ok(())
+    let code = if rc < 0 { -rc } else { rc };
+    // Unprivileged apps cannot select restricted TRANSPORT_VPN VirtualNetworks via fwmarkd (EPERM);
+    // callers fall back to binding the tunnel's local source IP + verifying kernel route selection.
+    if code == libc::EPERM || code == libc::EACCES {
+        return Ok(false);
+    }
+    Err(std::io::Error::from_raw_os_error(code)).context("android_setsocknetwork failed")
 }
 
 #[cfg(target_os = "android")]
-fn android_network_has_global_ipv6(net_handle: u64) -> bool {
-    use std::os::fd::AsRawFd;
-    if net_handle == 0 {
-        return false;
-    }
-    let Ok(sock) = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) else {
-        return false;
+fn verify_android_vpn_route(target: SocketAddr, expected_local: IpAddr) -> Result<()> {
+    let unspec: SocketAddr = if target.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
     };
-    if bind_fd_to_android_network(sock.as_raw_fd(), net_handle).is_err() {
-        return false;
+    let probe = std::net::UdpSocket::bind(unspec)?;
+    probe.connect(target)?;
+    let selected = probe.local_addr()?.ip();
+    ensure!(
+        selected == expected_local,
+        "Android kernel route for {target} bypassed VPN source address ({selected} != {expected_local})"
+    );
+    Ok(())
+}
+
+async fn send_bound_udp(
+    sock: &tokio::net::UdpSocket,
+    buf: &[u8],
+    target: SocketAddr,
+    binding: &VpnBinding,
+) -> Result<usize> {
+    #[cfg(target_os = "android")]
+    if let VpnBinding::AndroidNetwork {
+        iface, ipv4, ipv6, ..
+    } = binding
+    {
+        let expected = if target.is_ipv6() {
+            ipv6.map(IpAddr::V6).with_context(|| {
+                format!(
+                    "Android VPN '{}' has no global IPv6 address",
+                    iface.as_deref().unwrap_or("tunnel")
+                )
+            })?
+        } else {
+            ipv4.map(IpAddr::V4).with_context(|| {
+                format!(
+                    "Android VPN '{}' has no IPv4 address",
+                    iface.as_deref().unwrap_or("tunnel")
+                )
+            })?
+        };
+        verify_android_vpn_route(target, expected)?;
     }
-    let target = SocketAddr::V6(std::net::SocketAddrV6::new(
-        Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
-        53,
-        0,
-        0,
-    ));
-    if sock.connect(target).is_err() {
-        return false;
-    }
-    matches!(
-        sock.local_addr(),
-        Ok(SocketAddr::V6(sa)) if is_global_unicast_v6(*sa.ip())
-    )
+    #[cfg(not(target_os = "android"))]
+    let _ = binding;
+    Ok(sock.send_to(buf, target).await?)
 }
 
 #[cfg(windows)]
@@ -1011,19 +1139,24 @@ async fn bind_bound_udp(is_ipv6: bool, binding: &VpnBinding) -> Result<tokio::ne
             #[cfg(target_os = "android")]
             {
                 use std::os::fd::AsRawFd;
-                let bind_addr = match (is_ipv6, ipv6, ipv4) {
-                    (true, Some(v6), _) => SocketAddr::new(std::net::IpAddr::V6(*v6), 0),
-                    (false, _, Some(v4)) => SocketAddr::new(std::net::IpAddr::V4(*v4), 0),
-                    _ => unspec(is_ipv6),
-                };
-                let sock = tokio::net::UdpSocket::bind(bind_addr).await?;
-                if *net_handle != 0 {
-                    bind_fd_to_android_network(sock.as_raw_fd(), *net_handle)?;
-                } else if let Some(dev) = iface {
-                    sock.bind_device(Some(dev.as_bytes()))
-                        .with_context(|| format!("failed binding UDP socket to '{dev}'"))?;
+                let local_ip = if is_ipv6 {
+                    IpAddr::V6(ipv6.with_context(|| {
+                        format!(
+                            "Android VPN '{}' has no global IPv6 address",
+                            iface.as_deref().unwrap_or("tunnel")
+                        )
+                    })?)
                 } else {
-                    bail!("Android VPN UDP socket binding unavailable");
+                    IpAddr::V4(ipv4.with_context(|| {
+                        format!(
+                            "Android VPN '{}' has no IPv4 address",
+                            iface.as_deref().unwrap_or("tunnel")
+                        )
+                    })?)
+                };
+                let sock = tokio::net::UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?;
+                if *net_handle != 0 {
+                    let _ = bind_fd_to_android_network(sock.as_raw_fd(), *net_handle)?;
                 }
                 Ok(sock)
             }
@@ -1123,23 +1256,26 @@ async fn connect_bound_tcp(target: SocketAddr, binding: &VpnBinding) -> Result<T
             #[cfg(target_os = "android")]
             {
                 use std::os::fd::AsRawFd;
-                if *net_handle != 0 {
-                    bind_fd_to_android_network(sock.as_raw_fd(), *net_handle)?;
-                } else if let Some(dev) = iface {
-                    sock.bind_device(Some(dev.as_bytes()))
-                        .with_context(|| format!("failed binding TCP socket to '{dev}'"))?;
+                let local_ip = if target.is_ipv6() {
+                    IpAddr::V6(ipv6.with_context(|| {
+                        format!(
+                            "Android VPN '{}' has no global IPv6 address",
+                            iface.as_deref().unwrap_or("tunnel")
+                        )
+                    })?)
                 } else {
-                    bail!("Android VPN TCP socket binding unavailable");
+                    IpAddr::V4(ipv4.with_context(|| {
+                        format!(
+                            "Android VPN '{}' has no IPv4 address",
+                            iface.as_deref().unwrap_or("tunnel")
+                        )
+                    })?)
+                };
+                verify_android_vpn_route(target, local_ip)?;
+                if *net_handle != 0 {
+                    let _ = bind_fd_to_android_network(sock.as_raw_fd(), *net_handle)?;
                 }
-                match (target.is_ipv6(), ipv6, ipv4) {
-                    (true, Some(v6), _) => {
-                        sock.bind(SocketAddr::new(std::net::IpAddr::V6(*v6), 0))?
-                    }
-                    (false, _, Some(v4)) => {
-                        sock.bind(SocketAddr::new(std::net::IpAddr::V4(*v4), 0))?
-                    }
-                    _ => {}
-                }
+                sock.bind(SocketAddr::new(local_ip, 0))?;
             }
             #[cfg(not(target_os = "android"))]
             {
@@ -1442,7 +1578,10 @@ async fn query_dns_record(
     };
 
     if let Ok(sock) = bind_bound_udp(server.is_ipv6(), eff_binding).await {
-        if sock.send_to(&query, server).await.is_ok() {
+        if send_bound_udp(&sock, &query, server, eff_binding)
+            .await
+            .is_ok()
+        {
             let mut buf = [0u8; 4096];
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             while let Ok(Ok((n, src))) =
@@ -2003,8 +2142,8 @@ async fn announce_udp_tracker_peers(
         connect_req[0..8].copy_from_slice(&0x41727101980u64.to_be_bytes());
         connect_req[8..12].copy_from_slice(&0u32.to_be_bytes());
         connect_req[12..16].copy_from_slice(&tid_connect.to_be_bytes());
-        if let Err(e) = sock.send_to(&connect_req, target).await {
-            last_err = Some(e.into());
+        if let Err(e) = send_bound_udp(&sock, &connect_req, target, binding).await {
+            last_err = Some(e);
             continue;
         }
         let mut recv_buf = [0u8; 4096];
@@ -2042,7 +2181,10 @@ async fn announce_udp_tracker_peers(
         ann_req[88..92].copy_from_slice(&key.to_be_bytes());
         ann_req[92..96].copy_from_slice(&200i32.to_be_bytes());
         ann_req[96..98].copy_from_slice(&6881u16.to_be_bytes());
-        if sock.send_to(&ann_req, target).await.is_err() {
+        if send_bound_udp(&sock, &ann_req, target, binding)
+            .await
+            .is_err()
+        {
             continue;
         }
         let Ok(Ok((n_ann, _))) =
@@ -2070,6 +2212,31 @@ async fn announce_udp_tracker_peers(
     Ok(peers)
 }
 
+fn build_tracker_announce_url(
+    tracker_url: &url::Url,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    numwant: Option<u32>,
+) -> url::Url {
+    let mut u = tracker_url.clone();
+    let mut params = format!(
+        "info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left=16384&compact=1",
+        percent_encode_20(info_hash),
+        percent_encode_20(peer_id),
+    );
+    if let Some(nw) = numwant {
+        params.push_str(&format!("&numwant={nw}"));
+    }
+    params.push_str("&event=started");
+    let existing = u.query().map(str::trim).filter(|q| !q.is_empty());
+    let query = match existing {
+        Some(prefix) => format!("{prefix}&{params}"),
+        None => params,
+    };
+    u.set_query(Some(&query));
+    u
+}
+
 async fn announce_http_tracker_peers(
     client: &reqwest::Client,
     tracker_url: &url::Url,
@@ -2078,19 +2245,7 @@ async fn announce_http_tracker_peers(
     ipv4_only: bool,
     allow_loopback: bool,
 ) -> Result<Vec<SocketAddr>> {
-    let mut u = tracker_url.clone();
-    let mut query = format!(
-        "info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left=16384&compact=1&numwant=200&event=started",
-        percent_encode_20(info_hash),
-        percent_encode_20(peer_id),
-    );
-    if let Some(existing) = u.query() {
-        if !existing.is_empty() {
-            query.push('&');
-            query.push_str(existing);
-        }
-    }
-    u.set_query(Some(&query));
+    let u = build_tracker_announce_url(tracker_url, info_hash, peer_id, Some(200));
     let resp = client.get(u.as_str()).send().await?;
     ensure!(
         resp.status().is_success(),
@@ -2100,6 +2255,18 @@ async fn announce_http_tracker_peers(
     let body = resp.bytes().await?;
     ensure!(body.len() <= 512 * 1024, "HTTP tracker response too large");
     extract_bencode_tracker_peers(&body, ipv4_only, allow_loopback)
+}
+
+fn mozilla_tls_root_certs() -> Vec<reqwest::Certificate> {
+    static CERTS: std::sync::OnceLock<Vec<reqwest::Certificate>> = std::sync::OnceLock::new();
+    CERTS
+        .get_or_init(|| {
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok())
+                .collect()
+        })
+        .clone()
 }
 
 async fn harvest_bound_tracker_peers(
@@ -2120,6 +2287,7 @@ async fn harvest_bound_tracker_peers(
         Some(url) => reqwest::Proxy::all(url).ok().and_then(|proxy| {
             reqwest::Client::builder()
                 .proxy(proxy)
+                .tls_certs_only(mozilla_tls_root_certs())
                 .timeout(Duration::from_millis(3500))
                 .connect_timeout(Duration::from_millis(2500))
                 .redirect(reqwest::redirect::Policy::limited(2))
@@ -2131,6 +2299,7 @@ async fn harvest_bound_tracker_peers(
             #[allow(unused_mut)]
             let mut builder = reqwest::Client::builder()
                 .no_proxy()
+                .tls_certs_only(mozilla_tls_root_certs())
                 .dns_resolver(Arc::new(BoundReqwestDnsResolver {
                     binding: binding.clone(),
                     ipv4_only,
@@ -3018,7 +3187,7 @@ impl TorrentEngine {
         }
 
         let mut harvested_peers: Vec<SocketAddr> = Vec::new();
-        if is_vpn_bound {
+        if is_vpn_bound || cfg!(target_os = "android") {
             harvested_peers = harvest_bound_tracker_peers(
                 &input.hash,
                 &input.trackers,
@@ -3694,40 +3863,48 @@ fn should_use_ipv4_only(bound_device: Option<&str>) -> bool {
     false
 }
 
+fn default_route_has_global_ipv6() -> bool {
+    let Ok(sock) = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    let probe = SocketAddr::V6(std::net::SocketAddrV6::new(
+        Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+        53,
+        0,
+        0,
+    ));
+    if sock.connect(probe).is_err() {
+        return false;
+    }
+    matches!(
+        sock.local_addr(),
+        Ok(SocketAddr::V6(sa)) if is_global_unicast_v6(*sa.ip())
+    )
+}
+
 fn should_use_ipv4_only_for_binding(binding: &VpnBinding) -> bool {
     if std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).is_err() {
         return true;
     }
     match binding {
-        VpnBinding::Unbound => false,
+        VpnBinding::Unbound => {
+            if cfg!(test) {
+                return false;
+            }
+            #[cfg(target_os = "android")]
+            if android_vpn_state().0 && extract_first_v4_and_global_v6(&android_vpn_addrs()).1.is_none()
+            {
+                return true;
+            }
+            !default_route_has_global_ipv6()
+        }
         VpnBinding::NativeDevice(dev) => should_use_ipv4_only(Some(dev.as_str())),
         VpnBinding::WindowsAdapter {
             ipv6,
             ipv6_if_index,
             ..
         } => ipv6.is_none() || *ipv6_if_index == 0,
-        VpnBinding::AndroidNetwork {
-            iface,
-            net_handle,
-            ipv6,
-            ..
-        } => {
-            if ipv6.is_some() {
-                return false;
-            }
-            #[cfg(target_os = "android")]
-            if !cfg!(test) && android_network_has_global_ipv6(*net_handle) {
-                return false;
-            }
-            #[cfg(not(target_os = "android"))]
-            let _ = net_handle;
-            if let Some(dev) = iface.as_deref() {
-                if current_interfaces().iter().any(|i| i.name == dev) {
-                    return should_use_ipv4_only(Some(dev));
-                }
-            }
-            true
-        }
+        VpnBinding::AndroidNetwork { ipv6, .. } => ipv6.is_none(),
     }
 }
 
@@ -3923,17 +4100,19 @@ fn parse_leak_probe_magnet(magnet_uri: &str) -> Result<ParsedLeakProbe> {
 
 fn build_leak_probe_http_client(binding: &VpnBinding) -> Result<reqwest::Client> {
     let bound_device = binding.iface_name();
+    let ipv4_only = should_use_ipv4_only_for_binding(binding);
     #[allow(unused_mut)]
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        .tls_certs_only(mozilla_tls_root_certs())
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(3))
         .user_agent("RStream/0.1");
-    if !matches!(binding, VpnBinding::Unbound) {
+    if !matches!(binding, VpnBinding::Unbound) || (!cfg!(test) && ipv4_only) {
         builder = builder.dns_resolver(Arc::new(BoundReqwestDnsResolver {
             binding: binding.clone(),
-            ipv4_only: should_use_ipv4_only_for_binding(binding),
+            ipv4_only,
             allow_loopback: cfg!(test),
         }));
     }
@@ -3999,19 +4178,7 @@ async fn announce_http_leak_tracker(
     info_hash: &[u8; 20],
     peer_id: &[u8; 20],
 ) -> Result<()> {
-    let mut u = tracker_url.clone();
-    let mut query = format!(
-        "info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left=16384&compact=1&event=started",
-        percent_encode_20(info_hash),
-        percent_encode_20(peer_id),
-    );
-    if let Some(existing) = u.query() {
-        if !existing.is_empty() {
-            query.push('&');
-            query.push_str(existing);
-        }
-    }
-    u.set_query(Some(&query));
+    let u = build_tracker_announce_url(tracker_url, info_hash, peer_id, None);
     let resp = client.get(u.as_str()).send().await?;
     ensure!(
         resp.status().is_success(),
@@ -4040,91 +4207,130 @@ async fn announce_udp_leak_tracker(
     let host = tracker_url.host_str().context("UDP tracker missing host")?;
     let port = tracker_url.port().context("UDP tracker missing port")?;
     let ipv4_only = should_use_ipv4_only_for_binding(binding);
-    let mut resolved =
-        resolve_host_bound(host, port, binding, ipv4_only, cfg!(test)).await?;
-    // Prefer IPv4 first when both families exist so IPv4-oriented leak detectors match reliably.
-    resolved.sort_by_key(|a| a.is_ipv6());
-    let target = *resolved
-        .first()
-        .context("no usable address for UDP tracker")?;
+    let resolved = resolve_host_bound(host, port, binding, ipv4_only, cfg!(test)).await?;
+    let v4_target = resolved.iter().copied().find(|a| a.is_ipv4());
+    let v6_target = (!ipv4_only)
+        .then(|| resolved.iter().copied().find(|a| a.is_ipv6()))
+        .flatten();
+    let targets: Vec<SocketAddr> = [v4_target, v6_target].into_iter().flatten().collect();
+    ensure!(!targets.is_empty(), "no usable address for UDP tracker");
 
-    let sock = bind_bound_udp(target.is_ipv6(), binding).await?;
+    let mut last_err = None;
+    for target in targets {
+        let sock = match bind_bound_udp(target.is_ipv6(), binding).await {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
 
-    // BEP-15 Step 1: Connect request (16 bytes)
-    let tid_connect = rand::thread_rng().next_u32();
-    let mut connect_req = [0u8; 16];
-    connect_req[0..8].copy_from_slice(&0x41727101980u64.to_be_bytes());
-    connect_req[8..12].copy_from_slice(&0u32.to_be_bytes());
-    connect_req[12..16].copy_from_slice(&tid_connect.to_be_bytes());
-    sock.send_to(&connect_req, target).await?;
+        // BEP-15 Step 1: Connect request (16 bytes)
+        let tid_connect = rand::thread_rng().next_u32();
+        let mut connect_req = [0u8; 16];
+        connect_req[0..8].copy_from_slice(&0x41727101980u64.to_be_bytes());
+        connect_req[8..12].copy_from_slice(&0u32.to_be_bytes());
+        connect_req[12..16].copy_from_slice(&tid_connect.to_be_bytes());
+        if let Err(e) = send_bound_udp(&sock, &connect_req, target, binding).await {
+            last_err = Some(e);
+            continue;
+        }
 
-    let mut recv_buf = [0u8; 2048];
-    let (n_conn, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut recv_buf))
-        .await
-        .context("UDP tracker connect timeout")??;
-    ensure!(n_conn >= 16, "UDP tracker connect response too short");
-    let action_conn = u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]);
-    let rx_tid_conn = u32::from_be_bytes([recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7]]);
-    ensure!(
-        rx_tid_conn == tid_connect,
-        "UDP tracker connect transaction mismatch"
-    );
-    if action_conn == 3 {
-        let msg = String::from_utf8_lossy(&recv_buf[8..n_conn]);
-        bail!("UDP tracker error: {msg}");
+        let mut recv_buf = [0u8; 2048];
+        let (n_conn, _) = match tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut recv_buf)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_err = Some(e.into());
+                continue;
+            }
+            Err(_) => {
+                last_err = Some(anyhow!("UDP tracker connect timeout"));
+                continue;
+            }
+        };
+        if n_conn < 16 {
+            last_err = Some(anyhow!("UDP tracker connect response too short"));
+            continue;
+        }
+        let action_conn = u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]);
+        let rx_tid_conn = u32::from_be_bytes([recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7]]);
+        if rx_tid_conn != tid_connect {
+            last_err = Some(anyhow!("UDP tracker connect transaction mismatch"));
+            continue;
+        }
+        if action_conn == 3 {
+            let msg = String::from_utf8_lossy(&recv_buf[8..n_conn]);
+            last_err = Some(anyhow!("UDP tracker error: {msg}"));
+            continue;
+        }
+        if action_conn != 0 {
+            last_err = Some(anyhow!("unexpected UDP tracker connect action {action_conn}"));
+            continue;
+        }
+        let connection_id = u64::from_be_bytes([
+            recv_buf[8],
+            recv_buf[9],
+            recv_buf[10],
+            recv_buf[11],
+            recv_buf[12],
+            recv_buf[13],
+            recv_buf[14],
+            recv_buf[15],
+        ]);
+
+        // BEP-15 Step 2: Announce request (98 bytes)
+        let tid_ann = rand::thread_rng().next_u32();
+        let mut ann_req = [0u8; 98];
+        ann_req[0..8].copy_from_slice(&connection_id.to_be_bytes());
+        ann_req[8..12].copy_from_slice(&1u32.to_be_bytes()); // ACTION_ANNOUNCE
+        ann_req[12..16].copy_from_slice(&tid_ann.to_be_bytes());
+        ann_req[16..36].copy_from_slice(info_hash);
+        ann_req[36..56].copy_from_slice(peer_id);
+        ann_req[56..64].copy_from_slice(&0u64.to_be_bytes()); // downloaded
+        ann_req[64..72].copy_from_slice(&16384u64.to_be_bytes()); // left
+        ann_req[72..80].copy_from_slice(&0u64.to_be_bytes()); // uploaded
+        ann_req[80..84].copy_from_slice(&2u32.to_be_bytes()); // EVENT_STARTED
+        ann_req[84..88].copy_from_slice(&0u32.to_be_bytes()); // ip = 0
+        ann_req[88..92].copy_from_slice(&key.to_be_bytes());
+        ann_req[92..96].copy_from_slice(&(-1i32).to_be_bytes()); // num_want = -1
+        ann_req[96..98].copy_from_slice(&6881u16.to_be_bytes()); // port = 6881
+        if let Err(e) = send_bound_udp(&sock, &ann_req, target, binding).await {
+            last_err = Some(e);
+            continue;
+        }
+
+        let (n_ann, _) = match tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut recv_buf)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_err = Some(e.into());
+                continue;
+            }
+            Err(_) => {
+                last_err = Some(anyhow!("UDP tracker announce timeout"));
+                continue;
+            }
+        };
+        if n_ann < 8 {
+            last_err = Some(anyhow!("UDP tracker announce response too short"));
+            continue;
+        }
+        let action_ann = u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]);
+        let rx_tid_ann = u32::from_be_bytes([recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7]]);
+        if rx_tid_ann != tid_ann {
+            last_err = Some(anyhow!("UDP tracker announce transaction mismatch"));
+            continue;
+        }
+        if action_ann == 3 {
+            let msg = String::from_utf8_lossy(&recv_buf[8..n_ann]);
+            last_err = Some(anyhow!("UDP tracker error: {msg}"));
+            continue;
+        }
+        if action_ann == 1 && n_ann >= 20 {
+            return Ok(());
+        }
+        last_err = Some(anyhow!("invalid UDP tracker announce response"));
     }
-    ensure!(
-        action_conn == 0,
-        "unexpected UDP tracker connect action {action_conn}"
-    );
-    let connection_id = u64::from_be_bytes([
-        recv_buf[8],
-        recv_buf[9],
-        recv_buf[10],
-        recv_buf[11],
-        recv_buf[12],
-        recv_buf[13],
-        recv_buf[14],
-        recv_buf[15],
-    ]);
-
-    // BEP-15 Step 2: Announce request (98 bytes)
-    let tid_ann = rand::thread_rng().next_u32();
-    let mut ann_req = [0u8; 98];
-    ann_req[0..8].copy_from_slice(&connection_id.to_be_bytes());
-    ann_req[8..12].copy_from_slice(&1u32.to_be_bytes()); // ACTION_ANNOUNCE
-    ann_req[12..16].copy_from_slice(&tid_ann.to_be_bytes());
-    ann_req[16..36].copy_from_slice(info_hash);
-    ann_req[36..56].copy_from_slice(peer_id);
-    ann_req[56..64].copy_from_slice(&0u64.to_be_bytes()); // downloaded
-    ann_req[64..72].copy_from_slice(&16384u64.to_be_bytes()); // left
-    ann_req[72..80].copy_from_slice(&0u64.to_be_bytes()); // uploaded
-    ann_req[80..84].copy_from_slice(&2u32.to_be_bytes()); // EVENT_STARTED
-    ann_req[84..88].copy_from_slice(&0u32.to_be_bytes()); // ip = 0
-    ann_req[88..92].copy_from_slice(&key.to_be_bytes());
-    ann_req[92..96].copy_from_slice(&(-1i32).to_be_bytes()); // num_want = -1
-    ann_req[96..98].copy_from_slice(&6881u16.to_be_bytes()); // port = 6881
-    sock.send_to(&ann_req, target).await?;
-
-    let (n_ann, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut recv_buf))
-        .await
-        .context("UDP tracker announce timeout")??;
-    ensure!(n_ann >= 8, "UDP tracker announce response too short");
-    let action_ann = u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]);
-    let rx_tid_ann = u32::from_be_bytes([recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7]]);
-    ensure!(
-        rx_tid_ann == tid_ann,
-        "UDP tracker announce transaction mismatch"
-    );
-    if action_ann == 3 {
-        let msg = String::from_utf8_lossy(&recv_buf[8..n_ann]);
-        bail!("UDP tracker error: {msg}");
-    }
-    ensure!(
-        action_ann == 1 && n_ann >= 20,
-        "invalid UDP tracker announce response"
-    );
-    Ok(())
+    Err(last_err.unwrap_or_else(|| anyhow!("UDP tracker announce failed")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4164,6 +4370,7 @@ async fn run_leak_probe_task(
                     Ok((socks_url, handle)) => match reqwest::Proxy::all(&socks_url).and_then(|p| {
                         reqwest::Client::builder()
                             .proxy(p)
+                            .tls_certs_only(mozilla_tls_root_certs())
                             .timeout(Duration::from_secs(10))
                             .connect_timeout(Duration::from_secs(5))
                             .redirect(reqwest::redirect::Policy::limited(3))
@@ -4262,17 +4469,18 @@ async fn run_leak_probe_task(
         }
         update_counts(None);
         while let Some(joined) = set.join_next().await {
-            if let Ok((idx, res)) = joined {
-                match res {
-                    Ok(()) => {
-                        if let Ok(mut ok) = succeeded.lock() {
-                            ok[idx] = true;
-                        }
-                        update_counts(None);
+            match joined {
+                Ok((idx, Ok(()))) => {
+                    if let Ok(mut ok) = succeeded.lock() {
+                        ok[idx] = true;
                     }
-                    Err(e) => {
-                        update_counts(Some(e.to_string()));
-                    }
+                    update_counts(None);
+                }
+                Ok((_idx, Err(e))) => {
+                    update_counts(Some(format!("{e:#}")));
+                }
+                Err(join_err) => {
+                    update_counts(Some(format!("tracker probe task aborted: {join_err}")));
                 }
             }
         }
@@ -4779,9 +4987,28 @@ mod tests {
     }
     #[test]
     fn android_vpn_state_roundtrip_and_immediate_cancel() {
-        set_android_vpn_state_with_handle(true, Some("tun0".into()), 42);
+        set_android_vpn_state_with_addrs(
+            true,
+            Some("tun0".into()),
+            42,
+            vec![
+                "10.88.0.2/24".into(),
+                "fe80::1/64".into(),
+                "fd58:dead::1/64".into(),
+                "127.0.0.1".into(),
+                "2606:4700:4700::1234/64".into(),
+            ],
+            vec!["1.1.1.1".parse().unwrap()],
+        );
         assert_eq!(android_vpn_state(), (true, Some("tun0".into())));
         assert_eq!(android_vpn_network_handle(), 42);
+        assert_eq!(
+            android_vpn_addrs(),
+            vec![
+                "10.88.0.2".to_owned(),
+                "2606:4700:4700::1234".to_owned(),
+            ]
+        );
 
         let token = CancellationToken::new();
         let policy = VpnPolicy {
@@ -4796,6 +5023,7 @@ mod tests {
         assert!(token.is_cancelled());
         assert_eq!(android_vpn_state(), (false, None));
         assert_eq!(android_vpn_network_handle(), 0);
+        assert!(android_vpn_addrs().is_empty());
     }
     #[test]
     fn episode_hint_and_video_selection() {
@@ -5992,6 +6220,40 @@ mod tests {
         assert!(err.to_string().contains("VPN killswitch blocked torrent"));
         assert!(!engine.leak_probe_status().active);
         assert_eq!(std::fs::read_dir(cache_dir.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ipleak_tracker_url_preserves_token_query_before_info_hash() -> Result<()> {
+        let hash_hex = "0123456789abcdef0123456789abcdef01234567";
+        let magnet = format!(
+            "magnet:?xt=urn:btih:{hash_hex}&tr=https://ipleak.net/announce.php%3Fh%3D{hash_hex}&dn=ipleak.net+torrent+detection"
+        );
+        let parsed = parse_leak_probe_magnet(&magnet)?;
+        assert_eq!(parsed.trackers.len(), 1);
+        let url = build_tracker_announce_url(&parsed.trackers[0], &parsed.info_hash, &random_peer_id(), None);
+        let q = url.query().unwrap_or("");
+        assert!(
+            q.starts_with(&format!("h={hash_hex}&info_hash=")),
+            "unexpected query string: {q}"
+        );
+        assert!(q.ends_with("&compact=1&event=started"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leak_probe_surfaces_tracker_task_panic_instead_of_swallowing() -> Result<()> {
+        let mut set = JoinSet::new();
+        set.spawn(async move {
+            panic!("synthetic panic");
+            #[allow(unreachable_code)]
+            (0usize, Ok::<(), anyhow::Error>(()))
+        });
+        let err_msg = match set.join_next().await {
+            Some(Err(join_err)) => format!("tracker probe task aborted: {join_err}"),
+            other => bail!("expected panic JoinError, got {other:?}"),
+        };
+        assert!(err_msg.contains("tracker probe task aborted"));
         Ok(())
     }
 

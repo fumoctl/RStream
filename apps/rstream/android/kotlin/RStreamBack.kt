@@ -522,6 +522,14 @@ object RStreamBack {
     }
 
     @JvmStatic
+    fun readClipboard(activity: Activity): String? {
+        val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager ?: return null
+        val clip = cm.primaryClip ?: return null
+        if (clip.itemCount <= 0) return null
+        return clip.getItemAt(0)?.coerceToText(activity)?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    @JvmStatic
     fun finishOAuth(activity: Activity, bringToFront: Boolean) {
         activity.runOnUiThread {
             RStreamOAuthService.stop()

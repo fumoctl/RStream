@@ -88,6 +88,37 @@ pub fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Initializes rustls-platform-verifier with the Android ApplicationContext and JVM before any TLS client runs.
+pub fn tls_verifier_init() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let ctx = ndk_context::android_context();
+        if ctx.vm().is_null() || ctx.context().is_null() {
+            log("rustls-platform-verifier init skipped: missing Android context");
+            return;
+        }
+        // SAFETY: `ctx.vm()` is the live process JavaVM registered by `android-activity`/`ndk_context`.
+        let vm = unsafe { jni_022::JavaVM::from_raw(ctx.vm().cast()) };
+        let res: std::result::Result<(), jni_022::errors::Error> = vm.attach_current_thread(|env| {
+            // SAFETY: `ctx.context()` is a valid Android Context jobject from `ndk_context`.
+            let raw_ctx = unsafe { jni_022::objects::JObject::from_raw(env, ctx.context().cast()) };
+            let app_ctx = jni_022::strings::JNIStr::from_cstr(c"getApplicationContext")
+                .zip(jni_022::signature::RuntimeMethodSignature::from_str("()Landroid/content/Context;").ok())
+                .and_then(|(name, sig)| {
+                    env.call_method(&raw_ctx, name, sig.method_signature(), &[])
+                        .and_then(|v| v.l())
+                        .ok()
+                })
+                .filter(|obj| !obj.is_null())
+                .unwrap_or(raw_ctx);
+            rustls_platform_verifier::android::init_with_env(env, app_ctx)
+        });
+        if let Err(e) = res {
+            log(&format!("rustls-platform-verifier init failed: {e}"));
+        }
+    });
+}
+
 /// Stops the Android OAuth foreground keepalive service and optionally pops the Custom Tab back to RStream.
 pub fn finish_oauth(bring_to_front: bool) {
     let _ = with_activity(|env, activity| {
@@ -221,6 +252,29 @@ pub fn set_back_enabled(enabled: bool) -> Result<()> {
     })
 }
 
+/// Reads plain text from the Android system clipboard when WebView's navigator.clipboard is restricted.
+pub fn read_clipboard() -> Option<String> {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.rstream.app.RStreamBack")?;
+        let res = env
+            .call_static_method(
+                &class,
+                "readClipboard",
+                "(Landroid/app/Activity;)Ljava/lang/String;",
+                &[JValue::Object(activity)],
+            )?
+            .l()?;
+        if res.is_null() {
+            Ok(None)
+        } else {
+            let text: String = env.get_string(&JString::from(res))?.into();
+            Ok(Some(text))
+        }
+    })
+    .ok()
+    .flatten()
+}
+
 // ---------------------------------------------------------------- VPN monitor (RStreamVpn.kt)
 
 static VPN_STATE: Mutex<(bool, Option<String>)> = Mutex::new((false, None));
@@ -240,6 +294,7 @@ pub extern "system" fn Java_dev_rstream_app_RStreamVpn_nativeVpnChanged(
     active: jboolean,
     iface: JString,
     net_handle: jlong,
+    addrs_csv: JString,
     dns_csv: JString,
 ) {
     let is_active = active != 0;
@@ -247,6 +302,19 @@ pub extern "system" fn Java_dev_rstream_app_RStreamVpn_nativeVpnChanged(
         None
     } else {
         env.get_string(&iface).ok().map(String::from).filter(|s| !s.is_empty())
+    };
+    let link_addrs: Vec<String> = if addrs_csv.is_null() {
+        Vec::new()
+    } else {
+        env.get_string(&addrs_csv)
+            .ok()
+            .map(String::from)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
     };
     let dns_servers: Vec<std::net::IpAddr> = if dns_csv.is_null() {
         Vec::new()
@@ -262,14 +330,18 @@ pub extern "system" fn Java_dev_rstream_app_RStreamVpn_nativeVpnChanged(
     if let Ok(mut slot) = VPN_STATE.lock() {
         *slot = (is_active, iface_name.clone());
     }
+    let addr_count = link_addrs.len();
     let dns_count = dns_servers.len();
-    stremio_torrent::set_android_vpn_state_full(
+    stremio_torrent::set_android_vpn_state_with_addrs(
         is_active,
         iface_name.clone(),
         net_handle as u64,
+        link_addrs,
         dns_servers,
     );
-    log(&format!("vpn state: active={is_active} iface={iface_name:?} handle={net_handle} dns_count={dns_count}"));
+    log(&format!(
+        "vpn state: active={is_active} iface={iface_name:?} handle={net_handle} addrs={addr_count} dns={dns_count}"
+    ));
 }
 
 // ---------------------------------------------------------------- Rust player surface (RStreamVideo.kt)

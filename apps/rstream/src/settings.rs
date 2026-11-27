@@ -5,6 +5,13 @@ use dioxus::prelude::*;
 use std::collections::HashMap;
 
 async fn read_clipboard_text() -> Option<String> {
+    #[cfg(target_os = "android")]
+    if let Some(txt) = crate::android::read_clipboard() {
+        let trimmed = txt.trim().to_owned();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
     let val = document::eval("return await (navigator.clipboard ? navigator.clipboard.readText() : '')").await.ok()?;
     val.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
 }

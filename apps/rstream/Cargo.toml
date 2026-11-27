@@ -1,6 +1,6 @@
 [package]
 name = "rstream"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license.workspace = true
@@ -46,4 +46,6 @@ gtk = "0.18"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21.1"
+jni_022 = { package = "jni", version = "0.22" }
 ndk-context = "0.1.1"
+rustls-platform-verifier = "0.7"

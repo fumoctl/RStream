@@ -21,10 +21,18 @@ object RStreamVpn {
         val active: Boolean,
         val iface: String?,
         val handle: Long,
+        val addrsCsv: String?,
         val dnsCsv: String?,
     )
 
-    @JvmStatic external fun nativeVpnChanged(active: Boolean, iface: String?, netHandle: Long, dnsCsv: String?)
+    @JvmStatic
+    external fun nativeVpnChanged(
+        active: Boolean,
+        iface: String?,
+        netHandle: Long,
+        addrsCsv: String?,
+        dnsCsv: String?,
+    )
 
     @JvmStatic
     fun init(activity: Activity) {
@@ -76,12 +84,16 @@ object RStreamVpn {
             val net = vpnNetworks.lastOrNull()
             val lp = net?.let { runCatching { cm.getLinkProperties(it) }.getOrNull() }
             val name = lp?.interfaceName
+            val addrs = lp?.linkAddresses
+                ?.mapNotNull { it.address?.hostAddress?.substringBefore('%')?.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.joinToString(",")
             val dns = lp?.dnsServers
                 ?.mapNotNull { it.hostAddress?.substringBefore('%')?.trim() }
                 ?.filter { it.isNotEmpty() }
                 ?.joinToString(",")
-            VpnSnapshot(net != null, name, net?.networkHandle ?: 0L, dns)
+            VpnSnapshot(net != null, name, net?.networkHandle ?: 0L, addrs, dns)
         }
-        runCatching { nativeVpnChanged(snap.active, snap.iface, snap.handle, snap.dnsCsv) }
+        runCatching { nativeVpnChanged(snap.active, snap.iface, snap.handle, snap.addrsCsv, snap.dnsCsv) }
     }
 }

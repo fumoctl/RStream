@@ -94,6 +94,8 @@ fn data_dir() -> PathBuf {
 pub fn init() -> Result<()> {
     // Android can launch the UI again in the same process (activity recreated): keep the backend.
     if BACKEND.get().is_some() { return Ok(()); }
+    #[cfg(target_os = "android")]
+    crate::android::tls_verifier_init();
     let workers = std::thread::available_parallelism().map(|n| n.get().clamp(2, 4)).unwrap_or(2);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
