@@ -14,7 +14,7 @@ use std::{
     fs::{File, OpenOptions},
     future::Future,
     io::SeekFrom,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -85,15 +85,18 @@ pub struct VpnPolicy {
     pub bind_interface: Option<String>,
 }
 
-static ANDROID_VPN_STATE: StdMutex<(bool, Option<String>, u64)> = StdMutex::new((false, None, 0));
+static ANDROID_VPN_STATE: StdMutex<(bool, Option<String>, u64, Vec<IpAddr>)> =
+    StdMutex::new((false, None, 0, Vec::new()));
 static ANDROID_VPN_WATCHERS: StdMutex<Vec<(VpnPolicy, u64, CancellationToken)>> =
     StdMutex::new(Vec::new());
 
 #[cfg(test)]
 static TEST_INTERFACES_OVERRIDE: StdMutex<Option<Vec<NetworkInterface>>> = StdMutex::new(None);
+#[cfg(test)]
+static TEST_BOUND_DNS_SERVER: StdMutex<Option<SocketAddr>> = StdMutex::new(None);
 
 pub fn set_android_vpn_state(active: bool, iface_name: Option<String>) {
-    set_android_vpn_state_with_handle(active, iface_name, 0);
+    set_android_vpn_state_full(active, iface_name, 0, Vec::new());
 }
 
 pub fn set_android_vpn_state_with_handle(
@@ -101,13 +104,37 @@ pub fn set_android_vpn_state_with_handle(
     iface_name: Option<String>,
     net_handle: u64,
 ) {
+    set_android_vpn_state_full(active, iface_name, net_handle, Vec::new());
+}
+
+fn is_usable_dns_server_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local(),
+        IpAddr::V6(v6) => is_global_unicast_v6(v6),
+    }
+}
+
+pub fn set_android_vpn_state_full(
+    active: bool,
+    iface_name: Option<String>,
+    net_handle: u64,
+    dns_servers: Vec<IpAddr>,
+) {
     let iface = iface_name.and_then(|s| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_owned())
     });
     let effective_handle = if active { net_handle } else { 0 };
+    let filtered_dns: Vec<IpAddr> = if active {
+        dns_servers
+            .into_iter()
+            .filter(|ip| is_usable_dns_server_ip(*ip))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if let Ok(mut guard) = ANDROID_VPN_STATE.lock() {
-        *guard = (active, iface.clone(), effective_handle);
+        *guard = (active, iface.clone(), effective_handle, filtered_dns);
     }
     if let Ok(mut watchers) = ANDROID_VPN_WATCHERS.lock() {
         watchers.retain(|(policy, expected_handle, token)| {
@@ -138,6 +165,13 @@ pub fn android_vpn_state() -> (bool, Option<String>) {
 
 pub fn android_vpn_network_handle() -> u64 {
     ANDROID_VPN_STATE.lock().map(|g| g.2).unwrap_or(0)
+}
+
+pub fn android_vpn_dns_servers() -> Vec<IpAddr> {
+    ANDROID_VPN_STATE
+        .lock()
+        .map(|g| g.3.clone())
+        .unwrap_or_default()
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -272,6 +306,7 @@ struct WinAdapterDetail {
     iface: NetworkInterface,
     if_index: u32,
     ipv6_if_index: u32,
+    dns_servers: Vec<IpAddr>,
 }
 
 #[cfg(windows)]
@@ -281,7 +316,7 @@ fn win_list_adapter_details() -> Vec<WinAdapterDetail> {
     const AF_UNSPEC: u32 = 0;
     const AF_INET: u16 = 2;
     const AF_INET6: u16 = 23;
-    const GAA_FLAGS: u32 = 0x0002 | 0x0004 | 0x0008; // SKIP_ANYCAST | SKIP_MULTICAST | SKIP_DNS_SERVER
+    const GAA_FLAGS: u32 = 0x0002 | 0x0004; // SKIP_ANYCAST | SKIP_MULTICAST (keep DNS servers)
     const ERROR_SUCCESS: u32 = 0;
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
     const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
@@ -329,7 +364,8 @@ fn win_list_adapter_details() -> Vec<WinAdapterDetail> {
     }
 
     // Matches Win32 `_IP_ADAPTER_ADDRESSES_LH`: IfIndex sits in the top union (after Length),
-    // and Ipv6IfIndex sits immediately after OperStatus.
+    // Ipv6IfIndex sits immediately after OperStatus, and IP_ADAPTER_DNS_SERVER_ADDRESS_XP shares
+    // the `{ alignment, next, address }` prefix layout with IP_ADAPTER_UNICAST_ADDRESS_LH.
     #[repr(C, align(8))]
     #[allow(dead_code)]
     struct WinAdapterAddresses {
@@ -340,7 +376,7 @@ fn win_list_adapter_details() -> Vec<WinAdapterDetail> {
         first_unicast_address: *const WinAdapterUnicastAddress,
         first_anycast_address: *const c_void,
         first_multicast_address: *const c_void,
-        first_dns_server_address: *const c_void,
+        first_dns_server_address: *const WinAdapterUnicastAddress,
         dns_suffix: *const u16,
         description: *const u16,
         friendly_name: *const u16,
@@ -430,38 +466,49 @@ fn win_list_adapter_details() -> Vec<WinAdapterDetail> {
             continue;
         };
 
-        let mut addrs = Vec::new();
-        let mut uni = adapter.first_unicast_address;
-        while !uni.is_null() {
-            // SAFETY: `uni` walks the unicast address list inside `backing`.
-            let node = unsafe { &*uni };
-            uni = node.next;
-            let sa = node.address.lp_socket_address;
-            let sa_len = node.address.i_socket_address_length as usize;
-            if sa.is_null() || sa_len < std::mem::size_of::<u16>() {
-                continue;
-            }
-            // SAFETY: `sa` has at least 2 bytes for `sa_family`.
-            let family = unsafe { (*sa).sa_family };
-            let ip = if family == AF_INET && sa_len >= std::mem::size_of::<WinSockAddrIn>() {
-                // SAFETY: `sa_len` covers `WinSockAddrIn`.
-                let sin = unsafe { std::ptr::read_unaligned(sa.cast::<WinSockAddrIn>()) };
-                let v4 = Ipv4Addr::from(sin.sin_addr);
-                (!v4.is_loopback() && !v4.is_unspecified()).then(|| v4.to_string())
-            } else if family == AF_INET6 && sa_len >= std::mem::size_of::<WinSockAddrIn6>() {
-                // SAFETY: `sa_len` covers `WinSockAddrIn6`.
-                let sin6 = unsafe { std::ptr::read_unaligned(sa.cast::<WinSockAddrIn6>()) };
-                let v6 = Ipv6Addr::from(sin6.sin6_addr);
-                is_global_unicast_v6(v6).then(|| v6.to_string())
-            } else {
-                None
-            };
-            if let Some(ip) = ip {
-                if !addrs.contains(&ip) {
-                    addrs.push(ip);
+        let collect_addr_ips = |mut node_ptr: *const WinAdapterUnicastAddress| -> Vec<IpAddr> {
+            let mut ips = Vec::new();
+            while !node_ptr.is_null() {
+                // SAFETY: `node_ptr` walks a linked address list inside `backing`.
+                let node = unsafe { &*node_ptr };
+                node_ptr = node.next;
+                let sa = node.address.lp_socket_address;
+                let sa_len = node.address.i_socket_address_length as usize;
+                if sa.is_null() || sa_len < std::mem::size_of::<u16>() {
+                    continue;
+                }
+                // SAFETY: `sa` has at least 2 bytes for `sa_family`.
+                let family = unsafe { (*sa).sa_family };
+                let ip = if family == AF_INET && sa_len >= std::mem::size_of::<WinSockAddrIn>() {
+                    // SAFETY: `sa_len` covers `WinSockAddrIn`.
+                    let sin = unsafe { std::ptr::read_unaligned(sa.cast::<WinSockAddrIn>()) };
+                    let v4 = Ipv4Addr::from(sin.sin_addr);
+                    (!v4.is_loopback() && !v4.is_unspecified()).then_some(IpAddr::V4(v4))
+                } else if family == AF_INET6 && sa_len >= std::mem::size_of::<WinSockAddrIn6>() {
+                    // SAFETY: `sa_len` covers `WinSockAddrIn6`.
+                    let sin6 = unsafe { std::ptr::read_unaligned(sa.cast::<WinSockAddrIn6>()) };
+                    let v6 = Ipv6Addr::from(sin6.sin6_addr);
+                    is_global_unicast_v6(v6).then_some(IpAddr::V6(v6))
+                } else {
+                    None
+                };
+                if let Some(ip) = ip {
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
                 }
             }
-        }
+            ips
+        };
+
+        let addrs: Vec<String> = collect_addr_ips(adapter.first_unicast_address)
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect();
+        let dns_servers: Vec<IpAddr> = collect_addr_ips(adapter.first_dns_server_address)
+            .into_iter()
+            .filter(|ip| is_usable_dns_server_ip(*ip))
+            .collect();
 
         let is_up = adapter.oper_status == IF_OPER_STATUS_UP;
         let is_vpn_like = is_vpn_interface_name(&name)
@@ -476,6 +523,7 @@ fn win_list_adapter_details() -> Vec<WinAdapterDetail> {
             },
             if_index: adapter.if_index,
             ipv6_if_index: adapter.ipv6_if_index,
+            dns_servers,
         });
     }
     out
@@ -555,6 +603,7 @@ fn current_win_adapter_details() -> Vec<WinAdapterDetail> {
                         iface: iface.clone(),
                         if_index: if v4.is_some() { idx } else { 0 },
                         ipv6_if_index: if v6.is_some() { idx } else { 0 },
+                        dns_servers: Vec::new(),
                     }
                 })
                 .collect();
@@ -582,12 +631,14 @@ enum VpnBinding {
         ipv6_if_index: u32,
         ipv4: Option<Ipv4Addr>,
         ipv6: Option<Ipv6Addr>,
+        dns_servers: Vec<IpAddr>,
     },
     AndroidNetwork {
         iface: Option<String>,
         net_handle: u64,
         ipv4: Option<Ipv4Addr>,
         ipv6: Option<Ipv6Addr>,
+        dns_servers: Vec<IpAddr>,
     },
 }
 
@@ -667,6 +718,7 @@ fn resolve_vpn_binding(policy: &VpnPolicy) -> Result<VpnBinding> {
         ipv6_if_index: detail.ipv6_if_index,
         ipv4,
         ipv6,
+        dns_servers: detail.dns_servers,
     })
 }
 
@@ -685,6 +737,7 @@ fn resolve_vpn_binding(policy: &VpnPolicy) -> Result<VpnBinding> {
             );
         }
         let net_handle = android_vpn_network_handle();
+        let dns_servers = android_vpn_dns_servers();
         let ifaces = current_interfaces();
         let (ipv4, ipv6) = current_iface
             .as_deref()
@@ -696,6 +749,7 @@ fn resolve_vpn_binding(policy: &VpnPolicy) -> Result<VpnBinding> {
             net_handle,
             ipv4,
             ipv6,
+            dns_servers,
         });
     }
     Ok(VpnBinding::Unbound)
@@ -917,6 +971,7 @@ async fn bind_bound_udp(is_ipv6: bool, binding: &VpnBinding) -> Result<tokio::ne
             ipv6_if_index,
             ipv4,
             ipv6,
+            ..
         } => {
             #[cfg(windows)]
             {
@@ -951,6 +1006,7 @@ async fn bind_bound_udp(is_ipv6: bool, binding: &VpnBinding) -> Result<tokio::ne
             net_handle,
             ipv4,
             ipv6,
+            ..
         } => {
             #[cfg(target_os = "android")]
             {
@@ -984,7 +1040,6 @@ async fn bind_bound_udp(is_ipv6: bool, binding: &VpnBinding) -> Result<tokio::ne
     }
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 async fn connect_bound_tcp(target: SocketAddr, binding: &VpnBinding) -> Result<TcpStream> {
     let sock = if target.is_ipv6() {
         tokio::net::TcpSocket::new_v6()?
@@ -1029,6 +1084,7 @@ async fn connect_bound_tcp(target: SocketAddr, binding: &VpnBinding) -> Result<T
             ipv6_if_index,
             ipv4,
             ipv6,
+            ..
         } => {
             #[cfg(windows)]
             {
@@ -1062,6 +1118,7 @@ async fn connect_bound_tcp(target: SocketAddr, binding: &VpnBinding) -> Result<T
             net_handle,
             ipv4,
             ipv6,
+            ..
         } => {
             #[cfg(target_os = "android")]
             {
@@ -1142,6 +1199,404 @@ async fn send_socks5_reply(client: &mut TcpStream, rep: u8, bound: Option<Socket
         }
     };
     let _ = client.write_all(&pkt[..len]).await;
+}
+
+const DNS_QTYPE_A: u16 = 1;
+const DNS_QTYPE_AAAA: u16 = 28;
+
+#[cfg(unix)]
+fn is_lan_192_168(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 192 && v4.octets()[1] == 168)
+}
+
+#[cfg(test)]
+fn is_test_dns_server(server: SocketAddr) -> bool {
+    TEST_BOUND_DNS_SERVER
+        .lock()
+        .ok()
+        .is_some_and(|g| *g == Some(server))
+}
+
+#[cfg(not(test))]
+fn is_test_dns_server(_server: SocketAddr) -> bool {
+    false
+}
+
+fn bound_dns_servers(binding: &VpnBinding, ipv4_only: bool) -> Vec<SocketAddr> {
+    #[cfg(test)]
+    if let Ok(guard) = TEST_BOUND_DNS_SERVER.lock() {
+        if let Some(srv) = *guard {
+            if !ipv4_only || srv.is_ipv4() {
+                return vec![srv];
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push_ip = |ip: IpAddr| {
+        if ipv4_only && ip.is_ipv6() {
+            return;
+        }
+        if !is_usable_dns_server_ip(ip) {
+            return;
+        }
+        if let VpnBinding::WindowsAdapter {
+            if_index,
+            ipv6_if_index,
+            ipv4,
+            ipv6,
+            ..
+        } = binding
+        {
+            match ip {
+                IpAddr::V4(_) if *if_index == 0 || ipv4.is_none() => return,
+                IpAddr::V6(_) if *ipv6_if_index == 0 || ipv6.is_none() => return,
+                _ => {}
+            }
+        }
+        let addr = SocketAddr::new(ip, 53);
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    };
+
+    match binding {
+        VpnBinding::WindowsAdapter { dns_servers, .. }
+        | VpnBinding::AndroidNetwork { dns_servers, .. } => {
+            for ip in dns_servers {
+                push_ip(*ip);
+            }
+        }
+        VpnBinding::NativeDevice(iface) => {
+            #[cfg(unix)]
+            {
+                let iface_has_192_168 = current_interfaces()
+                    .iter()
+                    .find(|i| i.name == *iface)
+                    .is_some_and(|i| {
+                        i.addrs
+                            .iter()
+                            .filter_map(|a| a.parse::<IpAddr>().ok())
+                            .any(is_lan_192_168)
+                    });
+                if let Ok(resolv) = std::fs::read_to_string("/etc/resolv.conf") {
+                    for line in resolv.lines() {
+                        let clean = line.split(['#', ';']).next().unwrap_or("").trim();
+                        let mut parts = clean.split_whitespace();
+                        if parts.next() == Some("nameserver") {
+                            if let Some(raw_ip) = parts.next() {
+                                if let Ok(ip) = raw_ip.parse::<IpAddr>() {
+                                    if !is_lan_192_168(ip) || iface_has_192_168 {
+                                        push_ip(ip);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = iface;
+        }
+        VpnBinding::Unbound => {}
+    }
+
+    for fallback in [
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
+    ] {
+        push_ip(fallback);
+    }
+    out
+}
+
+fn build_dns_query(txid: u16, host: &str, qtype: u16) -> Result<Vec<u8>> {
+    let host = host.trim().trim_end_matches('.');
+    ensure!(
+        !host.is_empty() && host.len() <= 253,
+        "invalid DNS hostname length"
+    );
+    let mut pkt = Vec::with_capacity(18 + host.len());
+    pkt.extend_from_slice(&txid.to_be_bytes());
+    pkt.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
+    for label in host.split('.') {
+        ensure!(
+            !label.is_empty() && label.len() <= 63,
+            "invalid DNS label length"
+        );
+        ensure!(
+            label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid character in DNS hostname"
+        );
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&qtype.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
+    Ok(pkt)
+}
+
+fn skip_dns_name(pkt: &[u8], start: usize) -> Option<usize> {
+    let mut pos = start;
+    for _ in 0..128 {
+        let len = *pkt.get(pos)?;
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if (len & 0xc0) == 0xc0 {
+            let b1 = *pkt.get(pos + 1)?;
+            let ptr = (usize::from(len & 0x3f) << 8) | usize::from(b1);
+            if ptr >= pos || ptr >= pkt.len() {
+                return None;
+            }
+            return Some(pos + 2);
+        }
+        if (len & 0xc0) != 0 {
+            return None;
+        }
+        pos = pos.checked_add(1 + usize::from(len))?;
+        if pos > pkt.len() {
+            return None;
+        }
+    }
+    None
+}
+
+fn parse_dns_response(pkt: &[u8], expected_txid: u16, expected_qtype: u16) -> Result<(bool, Vec<IpAddr>)> {
+    ensure!(pkt.len() >= 12, "DNS response shorter than 12 bytes");
+    let txid = u16::from_be_bytes([pkt[0], pkt[1]]);
+    ensure!(txid == expected_txid, "DNS transaction ID mismatch");
+    let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+    ensure!((flags & 0x8000) != 0, "DNS packet is not a response");
+    if (flags & 0x0200) != 0 {
+        return Ok((true, Vec::new()));
+    }
+    let rcode = flags & 0x000f;
+    if rcode == 3 {
+        return Ok((false, Vec::new()));
+    }
+    ensure!(rcode == 0, "DNS server returned error rcode {rcode}");
+
+    let qdcount = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
+    let ancount = usize::from(u16::from_be_bytes([pkt[6], pkt[7]]));
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_dns_name(pkt, pos).context("malformed DNS question")?;
+        pos = pos.checked_add(4).context("truncated DNS question")?;
+        ensure!(pos <= pkt.len(), "truncated DNS question");
+    }
+
+    let mut addrs = Vec::new();
+    for _ in 0..ancount {
+        pos = skip_dns_name(pkt, pos).context("malformed DNS answer name")?;
+        ensure!(pos + 10 <= pkt.len(), "truncated DNS answer RR header");
+        let rtype = u16::from_be_bytes([pkt[pos], pkt[pos + 1]]);
+        let rclass = u16::from_be_bytes([pkt[pos + 2], pkt[pos + 3]]);
+        let rdlen = usize::from(u16::from_be_bytes([pkt[pos + 8], pkt[pos + 9]]));
+        pos += 10;
+        let rdata_end = pos.checked_add(rdlen).context("DNS RDATA overflow")?;
+        ensure!(rdata_end <= pkt.len(), "truncated DNS answer RDATA");
+        let rdata = &pkt[pos..rdata_end];
+        if rclass == 1 && rtype == DNS_QTYPE_A && expected_qtype == DNS_QTYPE_A && rdlen == 4 {
+            addrs.push(IpAddr::V4(Ipv4Addr::new(
+                rdata[0], rdata[1], rdata[2], rdata[3],
+            )));
+        } else if rclass == 1
+            && rtype == DNS_QTYPE_AAAA
+            && expected_qtype == DNS_QTYPE_AAAA
+            && rdlen == 16
+        {
+            let mut raw = [0u8; 16];
+            raw.copy_from_slice(rdata);
+            addrs.push(IpAddr::V6(Ipv6Addr::from(raw)));
+        }
+        pos = rdata_end;
+    }
+    Ok((false, addrs))
+}
+
+async fn query_dns_record(
+    server: SocketAddr,
+    binding: &VpnBinding,
+    host: &str,
+    qtype: u16,
+) -> Result<Vec<IpAddr>> {
+    let mut tx_bytes = [0u8; 2];
+    rand::thread_rng().fill_bytes(&mut tx_bytes);
+    let txid = u16::from_be_bytes(tx_bytes);
+    let query = build_dns_query(txid, host, qtype)?;
+    let eff_binding = if is_test_dns_server(server) {
+        &VpnBinding::Unbound
+    } else {
+        binding
+    };
+
+    if let Ok(sock) = bind_bound_udp(server.is_ipv6(), eff_binding).await {
+        if sock.send_to(&query, server).await.is_ok() {
+            let mut buf = [0u8; 4096];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while let Ok(Ok((n, src))) =
+                tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await
+            {
+                if src.ip() != server.ip() {
+                    continue;
+                }
+                if let Ok((truncated, addrs)) = parse_dns_response(&buf[..n], txid, qtype) {
+                    if !truncated {
+                        return Ok(addrs);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // RFC 1035 TCP fallback (also handles TC=1 truncated responses).
+    let tcp_res = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut stream = connect_bound_tcp(server, eff_binding).await?;
+        let qlen = u16::try_from(query.len()).context("DNS query exceeds 64 KiB")?;
+        stream.write_all(&qlen.to_be_bytes()).await?;
+        stream.write_all(&query).await?;
+        let mut rlen_buf = [0u8; 2];
+        stream.read_exact(&mut rlen_buf).await?;
+        let rlen = usize::from(u16::from_be_bytes(rlen_buf));
+        ensure!((12..=16384).contains(&rlen), "invalid TCP DNS response size");
+        let mut resp = vec![0u8; rlen];
+        stream.read_exact(&mut resp).await?;
+        let (_trunc, addrs) = parse_dns_response(&resp, txid, qtype)?;
+        Ok::<_, anyhow::Error>(addrs)
+    })
+    .await
+    .context("TCP DNS lookup timeout")??;
+    Ok(tcp_res)
+}
+
+async fn resolve_host_bound(
+    host: &str,
+    port: u16,
+    binding: &VpnBinding,
+    ipv4_only: bool,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>> {
+    let trimmed = host.trim();
+    let literal = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if let Ok(ip) = literal.parse::<IpAddr>() {
+        ensure!(
+            is_usable_peer_addr(ip, ipv4_only, allow_loopback),
+            "destination IP '{ip}' blocked by VPN address policy"
+        );
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let test_override_active = {
+        #[cfg(test)]
+        {
+            TEST_BOUND_DNS_SERVER
+                .lock()
+                .ok()
+                .is_some_and(|g| g.is_some())
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
+
+    if matches!(binding, VpnBinding::Unbound) && !test_override_active {
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((trimmed, port))
+            .await
+            .with_context(|| format!("failed resolving host {trimmed}:{port}"))?
+            .filter(|a| is_usable_peer_addr(a.ip(), ipv4_only, allow_loopback))
+            .collect();
+        ensure!(!addrs.is_empty(), "no usable addresses for {trimmed}");
+        return Ok(addrs);
+    }
+
+    let servers = bound_dns_servers(binding, ipv4_only);
+    ensure!(
+        !servers.is_empty(),
+        "no usable VPN DNS servers available for family"
+    );
+
+    let mut last_err = None;
+    for server in servers {
+        let (v4_res, v6_res) = if ipv4_only {
+            (
+                query_dns_record(server, binding, trimmed, DNS_QTYPE_A).await,
+                Ok(Vec::new()),
+            )
+        } else {
+            tokio::join!(
+                query_dns_record(server, binding, trimmed, DNS_QTYPE_A),
+                query_dns_record(server, binding, trimmed, DNS_QTYPE_AAAA),
+            )
+        };
+
+        let mut addrs = Vec::new();
+        let mut any_ok = false;
+        for res in [v4_res, v6_res] {
+            match res {
+                Ok(ips) => {
+                    any_ok = true;
+                    for ip in ips {
+                        if is_usable_peer_addr(ip, ipv4_only, allow_loopback) {
+                            let sa = SocketAddr::new(ip, port);
+                            if !addrs.contains(&sa) {
+                                addrs.push(sa);
+                            }
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if !addrs.is_empty() {
+            return Ok(addrs);
+        }
+        if any_ok {
+            break;
+        }
+    }
+
+    if let Some(err) = last_err {
+        return Err(err).with_context(|| format!("bound DNS lookup failed for {trimmed}"));
+    }
+    bail!("no usable DNS records resolved for {trimmed} over VPN");
+}
+
+struct BoundReqwestDnsResolver {
+    binding: VpnBinding,
+    ipv4_only: bool,
+    allow_loopback: bool,
+}
+
+impl reqwest::dns::Resolve for BoundReqwestDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let binding = self.binding.clone();
+        let ipv4_only = self.ipv4_only;
+        let allow_loopback = self.allow_loopback;
+        Box::pin(async move {
+            let addrs = resolve_host_bound(&host, 0, &binding, ipv4_only, allow_loopback)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
 }
 
 #[cfg(any(windows, target_os = "android", test))]
@@ -1232,10 +1687,7 @@ async fn handle_socks5_client(
                 client.read_exact(&mut port).await?;
                 let host = String::from_utf8(host_bytes).context("invalid SOCKS5 hostname")?;
                 let port = u16::from_be_bytes(port);
-                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-                    .await?
-                    .collect();
-                addrs
+                resolve_host_bound(&host, port, &binding, ipv4_only, allow_loopback).await?
             }
             other => {
                 send_socks5_reply(&mut client, 0x08, None).await;
@@ -1347,8 +1799,7 @@ async fn spawn_bound_socks5_proxy(
     Ok((url, handle))
 }
 
-#[cfg(any(windows, target_os = "android", test))]
-fn is_usable_peer_addr(ip: std::net::IpAddr, ipv4_only: bool, allow_loopback: bool) -> bool {
+fn is_usable_peer_addr(ip: IpAddr, ipv4_only: bool, allow_loopback: bool) -> bool {
     if ipv4_only && ip.is_ipv6() {
         return false;
     }
@@ -1356,25 +1807,23 @@ fn is_usable_peer_addr(ip: std::net::IpAddr, ipv4_only: bool, allow_loopback: bo
         return !ip.is_unspecified();
     }
     match ip {
-        std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_multicast(),
-        std::net::IpAddr::V6(v6) => is_global_unicast_v6(v6),
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_multicast(),
+        IpAddr::V6(v6) => is_global_unicast_v6(v6),
     }
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 fn parse_compact_v4_peers(bytes: &[u8], allow_loopback: bool) -> Vec<SocketAddr> {
     let mut out = Vec::with_capacity(bytes.len() / 6);
     for chunk in bytes.as_chunks::<6>().0 {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-        if port != 0 && is_usable_peer_addr(std::net::IpAddr::V4(ip), false, allow_loopback) {
+        if port != 0 && is_usable_peer_addr(IpAddr::V4(ip), false, allow_loopback) {
             out.push(SocketAddr::from((ip, port)));
         }
     }
     out
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 fn parse_compact_v6_peers(bytes: &[u8], allow_loopback: bool) -> Vec<SocketAddr> {
     let mut out = Vec::with_capacity(bytes.len() / 18);
     for chunk in bytes.as_chunks::<18>().0 {
@@ -1382,14 +1831,13 @@ fn parse_compact_v6_peers(bytes: &[u8], allow_loopback: bool) -> Vec<SocketAddr>
         raw.copy_from_slice(&chunk[..16]);
         let ip = Ipv6Addr::from(raw);
         let port = u16::from_be_bytes([chunk[16], chunk[17]]);
-        if port != 0 && is_usable_peer_addr(std::net::IpAddr::V6(ip), false, allow_loopback) {
+        if port != 0 && is_usable_peer_addr(IpAddr::V6(ip), false, allow_loopback) {
             out.push(SocketAddr::from((ip, port)));
         }
     }
     out
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 fn parse_bencode_int(input: &[u8]) -> Option<(i64, &[u8])> {
     let rest = input.strip_prefix(b"i")?;
     let end = rest.iter().position(|&b| b == b'e')?;
@@ -1397,7 +1845,6 @@ fn parse_bencode_int(input: &[u8]) -> Option<(i64, &[u8])> {
     Some((num, &rest[end + 1..]))
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 fn parse_bencode_bytes(input: &[u8]) -> Option<(&[u8], &[u8])> {
     let colon = input.iter().position(|&b| b == b':')?;
     let len = std::str::from_utf8(&input[..colon])
@@ -1411,7 +1858,6 @@ fn parse_bencode_bytes(input: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&after[..len], &after[len..]))
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 fn skip_bencode_value(input: &[u8], depth: u8) -> Option<&[u8]> {
     if depth > 32 {
         return None;
@@ -1438,14 +1884,13 @@ fn skip_bencode_value(input: &[u8], depth: u8) -> Option<&[u8]> {
     }
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 fn parse_non_compact_peer_dict(
     input: &[u8],
     ipv4_only: bool,
     allow_loopback: bool,
 ) -> Option<(Option<SocketAddr>, &[u8])> {
     let mut cur = input.strip_prefix(b"d")?;
-    let mut ip: Option<std::net::IpAddr> = None;
+    let mut ip: Option<IpAddr> = None;
     let mut port: Option<u16> = None;
     while !cur.starts_with(b"e") {
         let (key, after_key) = parse_bencode_bytes(cur)?;
@@ -1453,7 +1898,7 @@ fn parse_non_compact_peer_dict(
             b"ip" => {
                 let (val, rest) = parse_bencode_bytes(after_key)?;
                 if let Ok(s) = std::str::from_utf8(val) {
-                    ip = s.parse::<std::net::IpAddr>().ok();
+                    ip = s.parse::<IpAddr>().ok();
                 }
                 rest
             }
@@ -1472,7 +1917,6 @@ fn parse_non_compact_peer_dict(
     Some((addr, &cur[1..]))
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 fn extract_bencode_tracker_peers(
     body: &[u8],
     ipv4_only: bool,
@@ -1525,7 +1969,6 @@ fn extract_bencode_tracker_peers(
     Ok(peers)
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 async fn announce_udp_tracker_peers(
     tracker_url: &url::Url,
     binding: &VpnBinding,
@@ -1537,11 +1980,7 @@ async fn announce_udp_tracker_peers(
 ) -> Result<Vec<SocketAddr>> {
     let host = tracker_url.host_str().context("UDP tracker missing host")?;
     let port = tracker_url.port().context("UDP tracker missing port")?;
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("failed resolving UDP tracker {host}:{port}"))?
-        .filter(|a| !ipv4_only || a.is_ipv4())
-        .collect();
+    let resolved = resolve_host_bound(host, port, binding, ipv4_only, allow_loopback).await?;
     let v4_target = resolved.iter().copied().find(|a| a.is_ipv4());
     let v6_target = (!ipv4_only)
         .then(|| resolved.iter().copied().find(|a| a.is_ipv6()))
@@ -1631,7 +2070,6 @@ async fn announce_udp_tracker_peers(
     Ok(peers)
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 async fn announce_http_tracker_peers(
     client: &reqwest::Client,
     tracker_url: &url::Url,
@@ -1664,12 +2102,11 @@ async fn announce_http_tracker_peers(
     extract_bencode_tracker_peers(&body, ipv4_only, allow_loopback)
 }
 
-#[cfg(any(windows, target_os = "android", test))]
 async fn harvest_bound_tracker_peers(
     hash_hex: &str,
     trackers: &[String],
     binding: &VpnBinding,
-    socks_url: &str,
+    socks_url: Option<&str>,
     ipv4_only: bool,
     allow_loopback: bool,
     cancel: &CancellationToken,
@@ -1679,9 +2116,8 @@ async fn harvest_bound_tracker_peers(
     };
     let peer_id = random_peer_id();
     let key = rand::thread_rng().next_u32();
-    let http_client = reqwest::Proxy::all(socks_url)
-        .ok()
-        .and_then(|proxy| {
+    let http_client = match socks_url {
+        Some(url) => reqwest::Proxy::all(url).ok().and_then(|proxy| {
             reqwest::Client::builder()
                 .proxy(proxy)
                 .timeout(Duration::from_millis(3500))
@@ -1690,7 +2126,38 @@ async fn harvest_bound_tracker_peers(
                 .user_agent("rqbit 9.1.0")
                 .build()
                 .ok()
-        });
+        }),
+        None => {
+            #[allow(unused_mut)]
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(Arc::new(BoundReqwestDnsResolver {
+                    binding: binding.clone(),
+                    ipv4_only,
+                    allow_loopback,
+                }))
+                .timeout(Duration::from_millis(3500))
+                .connect_timeout(Duration::from_millis(2500))
+                .redirect(reqwest::redirect::Policy::limited(2))
+                .user_agent("rqbit 9.1.0");
+            #[cfg(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "illumos",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "solaris",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos",
+            ))]
+            if let Some(iface) = binding.iface_name() {
+                builder = builder.interface(iface);
+            }
+            builder.build().ok()
+        }
+    };
 
     let mut set = JoinSet::new();
     for raw in trackers.iter().take(16) {
@@ -2315,7 +2782,7 @@ impl TorrentEngine {
         let http_client = if binding.uses_socks_tunnel() {
             None
         } else {
-            Some(build_leak_probe_http_client(binding.iface_name())?)
+            Some(build_leak_probe_http_client(&binding)?)
         };
         let probe_token = self.register_lease_token()?;
         #[cfg(target_os = "android")]
@@ -2429,6 +2896,7 @@ impl TorrentEngine {
     ) -> Result<(Arc<ManagedTorrent>, usize, String, PathBuf, u64, u64)> {
         let ipv4_only = should_use_ipv4_only_for_binding(&binding);
         let uses_socks = binding.uses_socks_tunnel();
+        let is_vpn_bound = !matches!(binding, VpnBinding::Unbound);
 
         #[cfg(target_os = "android")]
         if matches!(binding, VpnBinding::AndroidNetwork { .. })
@@ -2437,7 +2905,7 @@ impl TorrentEngine {
             register_android_vpn_watcher(policy, binding.android_handle(), &lease.token);
         }
 
-        let (session_opts, socks_url) = if uses_socks {
+        let (session_opts, socks_url, has_dht) = if uses_socks {
             #[cfg(any(windows, target_os = "android", test))]
             {
                 let (socks_url, proxy_task) = spawn_bound_socks5_proxy(
@@ -2467,6 +2935,7 @@ impl TorrentEngine {
                         ..Default::default()
                     },
                     Some(socks_url),
+                    false,
                 )
             }
             #[cfg(not(any(windows, target_os = "android", test)))]
@@ -2481,13 +2950,43 @@ impl TorrentEngine {
                 VpnBinding::NativeDevice(name) => Some(name.clone()),
                 _ => None,
             };
+            let dht_cfg = if is_vpn_bound {
+                let mut bootstrap_ips = Vec::new();
+                for (host, port) in [
+                    ("dht.transmissionbt.com", 6881u16),
+                    ("dht.libtorrent.org", 25401u16),
+                ] {
+                    if let Ok(Ok(addrs)) = tokio::time::timeout(
+                        Duration::from_millis(2500),
+                        resolve_host_bound(host, port, &binding, ipv4_only, false),
+                    )
+                    .await
+                    {
+                        for sa in addrs {
+                            let s = sa.to_string();
+                            if !bootstrap_ips.contains(&s) {
+                                bootstrap_ips.push(s);
+                            }
+                        }
+                    }
+                }
+                (!bootstrap_ips.is_empty()).then(|| DhtSessionConfig {
+                    bootstrap_addrs: Some(bootstrap_ips),
+                    persistence: None,
+                    ..Default::default()
+                })
+            } else {
+                Some(DhtSessionConfig {
+                    persistence: None,
+                    ..Default::default()
+                })
+            };
+            let has_dht = dht_cfg.is_some();
             (
                 SessionOptions {
-                    dht: Some(DhtSessionConfig {
-                        persistence: None,
-                        ..Default::default()
-                    }),
+                    dht: dht_cfg,
                     bind_device_name: bind_dev,
+                    disable_trackers: is_vpn_bound,
                     listen: Some(ListenerOptions {
                         mode: ListenerMode::TcpAndUtp,
                         listen_addr,
@@ -2502,6 +3001,7 @@ impl TorrentEngine {
                     ..Default::default()
                 },
                 None::<String>,
+                has_dht,
             )
         };
 
@@ -2517,27 +3017,18 @@ impl TorrentEngine {
             ));
         }
 
-        #[cfg_attr(
-            not(any(windows, target_os = "android", test)),
-            allow(unused_mut)
-        )]
         let mut harvested_peers: Vec<SocketAddr> = Vec::new();
-        if let Some(socks_url) = socks_url.as_deref() {
-            #[cfg(any(windows, target_os = "android", test))]
-            {
-                harvested_peers = harvest_bound_tracker_peers(
-                    &input.hash,
-                    &input.trackers,
-                    &binding,
-                    socks_url,
-                    ipv4_only,
-                    false,
-                    &lease.token,
-                )
-                .await;
-            }
-            #[cfg(not(any(windows, target_os = "android", test)))]
-            let _ = socks_url;
+        if is_vpn_bound {
+            harvested_peers = harvest_bound_tracker_peers(
+                &input.hash,
+                &input.trackers,
+                &binding,
+                socks_url.as_deref(),
+                ipv4_only,
+                false,
+                &lease.token,
+            )
+            .await;
         }
 
         let cached_meta_path = lease.dir.join(".rstream.torrent");
@@ -2568,26 +3059,19 @@ impl TorrentEngine {
             None
         };
 
-        if cached_listed.is_none() && uses_socks && harvested_peers.is_empty() {
-            if let Some(socks_url) = socks_url.as_deref() {
-                #[cfg(any(windows, target_os = "android", test))]
-                {
-                    harvested_peers = harvest_bound_tracker_peers(
-                        &input.hash,
-                        &input.trackers,
-                        &binding,
-                        socks_url,
-                        ipv4_only,
-                        false,
-                        &lease.token,
-                    )
-                    .await;
-                }
-                #[cfg(not(any(windows, target_os = "android", test)))]
-                let _ = socks_url;
-            }
+        if cached_listed.is_none() && is_vpn_bound && harvested_peers.is_empty() {
+            harvested_peers = harvest_bound_tracker_peers(
+                &input.hash,
+                &input.trackers,
+                &binding,
+                socks_url.as_deref(),
+                ipv4_only,
+                false,
+                &lease.token,
+            )
+            .await;
             ensure!(
-                !harvested_peers.is_empty(),
+                has_dht || !harvested_peers.is_empty(),
                 "no reachable peers returned by bound HTTP/UDP trackers over VPN"
             );
         }
@@ -2603,7 +3087,7 @@ impl TorrentEngine {
                             list_only: true,
                             initial_peers: (!harvested_peers.is_empty())
                                 .then_some(harvested_peers.clone()),
-                            disable_trackers: uses_socks,
+                            disable_trackers: is_vpn_bound,
                             ..Default::default()
                         }),
                     )
@@ -2692,8 +3176,8 @@ impl TorrentEngine {
                     only_files: Some(vec![idx]),
                     output_folder: Some(lease.dir.to_string_lossy().into_owned()),
                     initial_peers: (!combined_peers.is_empty()).then_some(combined_peers),
-                    disable_trackers: uses_socks,
-                    trackers: (!uses_socks && !input.trackers.is_empty())
+                    disable_trackers: is_vpn_bound,
+                    trackers: (!is_vpn_bound && !input.trackers.is_empty())
                         .then_some(input.trackers.clone()),
                     ..Default::default()
                 }),
@@ -3437,7 +3921,8 @@ fn parse_leak_probe_magnet(magnet_uri: &str) -> Result<ParsedLeakProbe> {
     })
 }
 
-fn build_leak_probe_http_client(bound_device: Option<&str>) -> Result<reqwest::Client> {
+fn build_leak_probe_http_client(binding: &VpnBinding) -> Result<reqwest::Client> {
+    let bound_device = binding.iface_name();
     #[allow(unused_mut)]
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -3445,6 +3930,13 @@ fn build_leak_probe_http_client(bound_device: Option<&str>) -> Result<reqwest::C
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(3))
         .user_agent("RStream/0.1");
+    if !matches!(binding, VpnBinding::Unbound) {
+        builder = builder.dns_resolver(Arc::new(BoundReqwestDnsResolver {
+            binding: binding.clone(),
+            ipv4_only: should_use_ipv4_only_for_binding(binding),
+            allow_loopback: cfg!(test),
+        }));
+    }
     #[cfg(any(
         target_os = "android",
         target_os = "fuchsia",
@@ -3548,11 +4040,8 @@ async fn announce_udp_leak_tracker(
     let host = tracker_url.host_str().context("UDP tracker missing host")?;
     let port = tracker_url.port().context("UDP tracker missing port")?;
     let ipv4_only = should_use_ipv4_only_for_binding(binding);
-    let mut resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("failed resolving UDP tracker {host}:{port}"))?
-        .filter(|a| !ipv4_only || a.is_ipv4())
-        .collect();
+    let mut resolved =
+        resolve_host_bound(host, port, binding, ipv4_only, cfg!(test)).await?;
     // Prefer IPv4 first when both families exist so IPv4-oriented leak detectors match reliably.
     resolved.sort_by_key(|a| a.is_ipv6());
     let target = *resolved
@@ -5931,6 +6420,203 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), proxy_task).await?;
         srv_cancel.cancel();
         let _ = srv.await;
+        Ok(())
+    }
+
+    struct BoundDnsOverrideGuard;
+    impl BoundDnsOverrideGuard {
+        fn set(server: SocketAddr) -> Self {
+            *TEST_BOUND_DNS_SERVER.lock().unwrap() = Some(server);
+            Self
+        }
+    }
+    impl Drop for BoundDnsOverrideGuard {
+        fn drop(&mut self) {
+            *TEST_BOUND_DNS_SERVER.lock().unwrap() = None;
+        }
+    }
+
+    fn build_mock_dns_response(query: &[u8], a_ip: Option<Ipv4Addr>, aaaa_ip: Option<Ipv6Addr>) -> Option<Vec<u8>> {
+        if query.len() < 17 {
+            return None;
+        }
+        let qend = skip_dns_name(query, 12)?;
+        if qend + 4 > query.len() {
+            return None;
+        }
+        let qtype = u16::from_be_bytes([query[qend], query[qend + 1]]);
+        let mut resp = Vec::with_capacity(96);
+        resp.extend_from_slice(&query[0..2]); // TXID
+        resp.extend_from_slice(&0x8180u16.to_be_bytes()); // Standard response, no error
+        resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+
+        let include_v4 = qtype == DNS_QTYPE_A && a_ip.is_some();
+        let include_v6 = qtype == DNS_QTYPE_AAAA && aaaa_ip.is_some();
+        let has_record = include_v4 || include_v6;
+        // Include a CNAME + target A/AAAA when matching record exists to verify CNAME skipping.
+        let ancount: u16 = if has_record { 2 } else { 0 };
+        resp.extend_from_slice(&ancount.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        resp.extend_from_slice(&query[12..qend + 4]); // Question
+
+        if has_record {
+            // Answer 1: CNAME using compression pointer `0xc00c` -> alias `cdn.edge.invalid.`
+            let cname = [3u8, b'c', b'd', b'n', 4, b'e', b'd', b'g', b'e', 0];
+            resp.extend_from_slice(&[0xc0, 0x0c]);
+            resp.extend_from_slice(&5u16.to_be_bytes()); // CNAME
+            resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+            resp.extend_from_slice(&60u32.to_be_bytes());
+            resp.extend_from_slice(&(cname.len() as u16).to_be_bytes());
+            let alias_offset = resp.len() as u16;
+            resp.extend_from_slice(&cname);
+
+            // Answer 2: pointer to alias + A/AAAA RDATA
+            resp.extend_from_slice(&(0xc000u16 | alias_offset).to_be_bytes());
+            if let Some(v4) = a_ip.filter(|_| include_v4) {
+                resp.extend_from_slice(&DNS_QTYPE_A.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&60u32.to_be_bytes());
+                resp.extend_from_slice(&4u16.to_be_bytes());
+                resp.extend_from_slice(&v4.octets());
+            } else if let Some(v6) = aaaa_ip.filter(|_| include_v6) {
+                resp.extend_from_slice(&DNS_QTYPE_AAAA.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&60u32.to_be_bytes());
+                resp.extend_from_slice(&16u16.to_be_bytes());
+                resp.extend_from_slice(&v6.octets());
+            }
+        }
+        Some(resp)
+    }
+
+    async fn spawn_mock_dns_server(
+        a_ip: Option<Ipv4Addr>,
+        aaaa_ip: Option<Ipv6Addr>,
+        observed_qtypes: Arc<StdMutex<Vec<u16>>>,
+        cancel: CancellationToken,
+    ) -> Result<(SocketAddr, JoinHandle<()>)> {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = sock.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                let recv = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    r = sock.recv_from(&mut buf) => r,
+                };
+                let Ok((n, peer)) = recv else { continue };
+                if let Some(qend) = skip_dns_name(&buf[..n], 12) {
+                    if qend + 4 <= n {
+                        let qtype = u16::from_be_bytes([buf[qend], buf[qend + 1]]);
+                        observed_qtypes.lock().unwrap().push(qtype);
+                    }
+                }
+                if let Some(resp) = build_mock_dns_response(&buf[..n], a_ip, aaaa_ip) {
+                    let _ = sock.send_to(&resp, peer).await;
+                }
+            }
+        });
+        Ok((addr, task))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_dns_resolver_queries_vpn_dns_and_never_uses_system_resolver() -> Result<()> {
+        let _lock = TEST_OVERRIDE_LOCK.lock().await;
+        let qtypes = Arc::new(StdMutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let v4: Ipv4Addr = "93.184.216.34".parse()?;
+        let v6: Ipv6Addr = "2606:4700:4700::1111".parse()?;
+        let (dns_addr, dns_task) =
+            spawn_mock_dns_server(Some(v4), Some(v6), qtypes.clone(), cancel.clone()).await?;
+        let _guard = BoundDnsOverrideGuard::set(dns_addr);
+
+        let binding = VpnBinding::NativeDevice("wg-nonexistent0".into());
+        // `.invalid` is guaranteed unresolvable by system DNS; success proves bound RFC 1035 DNS ran.
+        let dual = resolve_host_bound("tracker.vpn-only.invalid", 6969, &binding, false, false)
+            .await?;
+        assert_eq!(
+            dual,
+            vec![SocketAddr::new(IpAddr::V4(v4), 6969), SocketAddr::new(IpAddr::V6(v6), 6969)]
+        );
+
+        qtypes.lock().unwrap().clear();
+        let v4_only =
+            resolve_host_bound("tracker.vpn-only.invalid", 6969, &binding, true, false).await?;
+        assert_eq!(v4_only, vec![SocketAddr::new(IpAddr::V4(v4), 6969)]);
+        assert_eq!(qtypes.lock().unwrap().as_slice(), &[DNS_QTYPE_A]);
+
+        cancel.cancel();
+        let _ = dns_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socks5_tunnel_resolves_hostname_via_bound_dns() -> Result<()> {
+        let _lock = TEST_OVERRIDE_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let target_port = listener.local_addr()?.port();
+        let cancel = CancellationToken::new();
+        let cancel_http = cancel.clone();
+        let http_task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = cancel_http.cancelled() => break,
+                    a = listener.accept() => a,
+                };
+                let Ok((mut sock, _)) = accepted else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+
+        let qtypes = Arc::new(StdMutex::new(Vec::new()));
+        let (dns_addr, dns_task) = spawn_mock_dns_server(
+            Some(Ipv4Addr::LOCALHOST),
+            None,
+            qtypes.clone(),
+            cancel.clone(),
+        )
+        .await?;
+        let _guard = BoundDnsOverrideGuard::set(dns_addr);
+
+        let (socks_url, proxy_task) = spawn_bound_socks5_proxy(
+            VpnBinding::AndroidNetwork {
+                iface: Some("tun0".into()),
+                net_handle: 1,
+                ipv4: None,
+                ipv6: None,
+                dns_servers: Vec::new(),
+            },
+            VpnPolicy::default(),
+            true,
+            true,
+            cancel.clone(),
+        )
+        .await?;
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&socks_url)?)
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let resp = client
+            .get(format!("http://echo.vpn-only.invalid:{target_port}/ping"))
+            .send()
+            .await?;
+        assert_eq!(resp.text().await?, "ok");
+        assert!(!qtypes.lock().unwrap().is_empty());
+
+        cancel.cancel();
+        let _ = proxy_task.await;
+        let _ = dns_task.await;
+        let _ = http_task.await;
         Ok(())
     }
 }

@@ -240,6 +240,7 @@ pub extern "system" fn Java_dev_rstream_app_RStreamVpn_nativeVpnChanged(
     active: jboolean,
     iface: JString,
     net_handle: jlong,
+    dns_csv: JString,
 ) {
     let is_active = active != 0;
     let iface_name = if iface.is_null() {
@@ -247,11 +248,28 @@ pub extern "system" fn Java_dev_rstream_app_RStreamVpn_nativeVpnChanged(
     } else {
         env.get_string(&iface).ok().map(String::from).filter(|s| !s.is_empty())
     };
+    let dns_servers: Vec<std::net::IpAddr> = if dns_csv.is_null() {
+        Vec::new()
+    } else {
+        env.get_string(&dns_csv)
+            .ok()
+            .map(String::from)
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            .collect()
+    };
     if let Ok(mut slot) = VPN_STATE.lock() {
         *slot = (is_active, iface_name.clone());
     }
-    stremio_torrent::set_android_vpn_state_with_handle(is_active, iface_name.clone(), net_handle as u64);
-    log(&format!("vpn state: active={is_active} iface={iface_name:?} handle={net_handle}"));
+    let dns_count = dns_servers.len();
+    stremio_torrent::set_android_vpn_state_full(
+        is_active,
+        iface_name.clone(),
+        net_handle as u64,
+        dns_servers,
+    );
+    log(&format!("vpn state: active={is_active} iface={iface_name:?} handle={net_handle} dns_count={dns_count}"));
 }
 
 // ---------------------------------------------------------------- Rust player surface (RStreamVideo.kt)

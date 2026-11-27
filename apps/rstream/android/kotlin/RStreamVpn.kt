@@ -17,7 +17,14 @@ object RStreamVpn {
     private val registered = AtomicBoolean(false)
     private val vpnNetworks = LinkedHashSet<Network>()
 
-    @JvmStatic external fun nativeVpnChanged(active: Boolean, iface: String?, netHandle: Long)
+    private data class VpnSnapshot(
+        val active: Boolean,
+        val iface: String?,
+        val handle: Long,
+        val dnsCsv: String?,
+    )
+
+    @JvmStatic external fun nativeVpnChanged(active: Boolean, iface: String?, netHandle: Long, dnsCsv: String?)
 
     @JvmStatic
     fun init(activity: Activity) {
@@ -65,11 +72,16 @@ object RStreamVpn {
     }
 
     private fun publish(cm: ConnectivityManager) {
-        val (active, iface, handle) = synchronized(vpnNetworks) {
+        val snap = synchronized(vpnNetworks) {
             val net = vpnNetworks.lastOrNull()
-            val name = net?.let { runCatching { cm.getLinkProperties(it)?.interfaceName }.getOrNull() }
-            Triple(net != null, name, net?.networkHandle ?: 0L)
+            val lp = net?.let { runCatching { cm.getLinkProperties(it) }.getOrNull() }
+            val name = lp?.interfaceName
+            val dns = lp?.dnsServers
+                ?.mapNotNull { it.hostAddress?.substringBefore('%')?.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.joinToString(",")
+            VpnSnapshot(net != null, name, net?.networkHandle ?: 0L, dns)
         }
-        runCatching { nativeVpnChanged(active, iface, handle) }
+        runCatching { nativeVpnChanged(snap.active, snap.iface, snap.handle, snap.dnsCsv) }
     }
 }
